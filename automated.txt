@@ -1,0 +1,328 @@
+#!/bin/bash
+#==============================
+# Automated K-Means Spark Runner (Enhanced)
+#==============================
+
+set -euo pipefail  # Exit on error, undefined vars, and pipe failures
+
+# Configurable parameters
+PROJECT_DIR="${PROJECT_DIR:-/home/cloudera/parallel-kmeans}"
+JAR_NAME="${JAR_NAME:-parallel-kmeans-1.0-SNAPSHOT.jar}"
+INPUT_PATH="${INPUT_PATH:-hdfs:///user/cloudera/data/iris_dataset}"
+NUM_CLUSTERS="${NUM_CLUSTERS:-3}"
+NUM_ITERATIONS="${NUM_ITERATIONS:-20}"
+SPARK_MASTER="${SPARK_MASTER:-local[*]}"
+EXECUTOR_MEMORY="${EXECUTOR_MEMORY:-2g}"
+DRIVER_MEMORY="${DRIVER_MEMORY:-1g}"
+LOG_DIR="$PROJECT_DIR/logs"
+RESULTS_DIR="$PROJECT_DIR/results"
+
+# Create necessary directories
+mkdir -p "$LOG_DIR" "$RESULTS_DIR"
+
+# Timestamp for this run
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+LOG_FILE="$LOG_DIR/kmeans_run_$TIMESTAMP.log"
+RESULT_FILE="$RESULTS_DIR/kmeans_result_$TIMESTAMP.txt"
+METRICS_FILE="$RESULTS_DIR/kmeans_metrics_$TIMESTAMP.json"
+
+# Colors for better visibility
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+NC='\033[0m' # No Color
+
+# Logging functions
+function log { echo -e "[$(date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"; }
+function info { log "${BLUE}[INFO]${NC} $1"; }
+function warn { log "${YELLOW}[WARN]${NC} $1"; }
+function error { log "${RED}[ERROR]${NC} $1"; }
+function success { log "${GREEN}[SUCCESS]${NC} $1"; }
+function debug { log "${CYAN}[DEBUG]${NC} $1"; }
+
+# Trap errors and cleanup
+trap 'error "Script failed at line $LINENO. Exit code: $?"; cleanup; exit 1' ERR
+trap 'warn "Script interrupted by user"; cleanup; exit 130' INT TERM
+
+function cleanup {
+    info "Performing cleanup..."
+    # Add any cleanup tasks here
+}
+
+# Print banner
+function print_banner {
+    echo -e "${MAGENTA}"
+    cat << "EOF"
+╔═══════════════════════════════════════════════════════╗
+║     K-Means Clustering with Apache Spark             ║
+║     Parallel Processing & Big Data Analytics         ║
+╚═══════════════════════════════════════════════════════╝
+EOF
+    echo -e "${NC}"
+}
+
+# Validate prerequisites
+function check_prerequisites {
+    info "Validating prerequisites..."
+    
+    local missing_tools=()
+    
+    for tool in mvn spark-submit hdfs; do
+        if ! command -v "$tool" &> /dev/null; then
+            missing_tools+=("$tool")
+        fi
+    done
+    
+    if [ ${#missing_tools[@]} -ne 0 ]; then
+        error "Missing required tools: ${missing_tools[*]}"
+        error "Please install missing tools and try again"
+        exit 1
+    fi
+    
+    success "All prerequisites validated"
+}
+
+# Check HDFS connectivity
+function check_hdfs {
+    info "Checking HDFS connectivity..."
+    
+    if ! hdfs dfs -ls / &> /dev/null; then
+        error "Cannot connect to HDFS. Please check Hadoop services"
+        exit 1
+    fi
+    
+    success "HDFS connection established"
+}
+
+# Validate input file
+function validate_input {
+    info "Validating input file: $INPUT_PATH"
+    
+    if ! hdfs dfs -test -e "$INPUT_PATH"; then
+        error "Input file $INPUT_PATH does not exist in HDFS"
+        info "Available files in parent directory:"
+        hdfs dfs -ls "$(dirname "$INPUT_PATH")" 2>/dev/null || warn "Cannot list parent directory"
+        exit 1
+    fi
+    
+    local file_size=$(hdfs dfs -du -s "$INPUT_PATH" | awk '{print $1}')
+    local file_size_mb=$((file_size / 1024 / 1024))
+    
+    info "Input file size: ${file_size_mb} MB"
+    success "Input file validated"
+}
+
+# Build project
+function build_project {
+    info "Changing to project directory: $PROJECT_DIR"
+    cd "$PROJECT_DIR" || { error "Project directory not found"; exit 1; }
+    
+    info "Cleaning previous build artifacts..."
+    mvn clean >> "$LOG_FILE" 2>&1
+    
+    info "Compiling and packaging project..."
+    if mvn package -DskipTests >> "$LOG_FILE" 2>&1; then
+        success "Maven build completed successfully"
+    else
+        error "Maven build failed. Check log: $LOG_FILE"
+        tail -n 50 "$LOG_FILE"
+        exit 1
+    fi
+    
+    # Verify JAR exists
+    if [ ! -f "target/$JAR_NAME" ]; then
+        error "Build artifact not found: target/$JAR_NAME"
+        exit 1
+    fi
+    
+    local jar_size=$(du -h "target/$JAR_NAME" | cut -f1)
+    success "JAR created: target/$JAR_NAME (${jar_size})"
+}
+
+# Run Spark job
+function run_spark_job {
+    info "Starting Spark K-Means clustering job..."
+    info "Configuration:"
+    info "  - Clusters: $NUM_CLUSTERS"
+    info "  - Iterations: $NUM_ITERATIONS"
+    info "  - Master: $SPARK_MASTER"
+    info "  - Executor Memory: $EXECUTOR_MEMORY"
+    info "  - Driver Memory: $DRIVER_MEMORY"
+    
+    local start_time=$(date +%s)
+    
+    spark-submit \
+        --class parallel.kmeans.ParallelKMeans \
+        --master "$SPARK_MASTER" \
+        --executor-memory "$EXECUTOR_MEMORY" \
+        --driver-memory "$DRIVER_MEMORY" \
+        --conf spark.ui.showConsoleProgress=true \
+        --conf spark.sql.shuffle.partitions=200 \
+        "target/$JAR_NAME" \
+        "$INPUT_PATH" \
+        "$NUM_CLUSTERS" \
+        "$NUM_ITERATIONS" 2>&1 | tee -a "$LOG_FILE" | tee "$RESULT_FILE"
+    
+    local exit_code=${PIPESTATUS[0]}
+    local end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+    
+    if [ $exit_code -eq 0 ]; then
+        success "Spark job completed in ${duration}s"
+        return 0
+    else
+        error "Spark job failed with exit code $exit_code"
+        return 1
+    fi
+}
+
+# Extract and format results
+function process_results {
+    info "Processing results..."
+    
+    if ! grep -q "Cluster centers:" "$RESULT_FILE"; then
+        error "Cluster centers not found in output"
+        return 1
+    fi
+    
+    # Extract cluster centers
+    local centers=$(grep -A 100 "Cluster centers:" "$RESULT_FILE" | head -n 20)
+    
+    # Create JSON metrics
+    cat > "$METRICS_FILE" << EOF
+{
+    "timestamp": "$TIMESTAMP",
+    "input_path": "$INPUT_PATH",
+    "num_clusters": $NUM_CLUSTERS,
+    "num_iterations": $NUM_ITERATIONS,
+    "spark_master": "$SPARK_MASTER",
+    "status": "success"
+}
+EOF
+    
+    success "Results processed and saved"
+    
+    # Display cluster centers
+    echo -e "\n${CYAN}╔════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║        Cluster Centers Found           ║${NC}"
+    echo -e "${CYAN}╚════════════════════════════════════════╝${NC}\n"
+    echo "$centers"
+}
+
+# Print execution summary
+function print_summary {
+    echo -e "\n${GREEN}╔════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║                  Execution Summary                     ║${NC}"
+    echo -e "${GREEN}╠════════════════════════════════════════════════════════╣${NC}"
+    printf "${GREEN}║${NC} %-20s : %-30s ${GREEN}║${NC}\n" "Timestamp" "$TIMESTAMP"
+    printf "${GREEN}║${NC} %-20s : %-30s ${GREEN}║${NC}\n" "Input Path" "$INPUT_PATH"
+    printf "${GREEN}║${NC} %-20s : %-30s ${GREEN}║${NC}\n" "Clusters" "$NUM_CLUSTERS"
+    printf "${GREEN}║${NC} %-20s : %-30s ${GREEN}║${NC}\n" "Iterations" "$NUM_ITERATIONS"
+    printf "${GREEN}║${NC} %-20s : %-30s ${GREEN}║${NC}\n" "Spark Master" "$SPARK_MASTER"
+    echo -e "${GREEN}╠════════════════════════════════════════════════════════╣${NC}"
+    printf "${GREEN}║${NC} %-20s : %-30s ${GREEN}║${NC}\n" "Result File" "$(basename $RESULT_FILE)"
+    printf "${GREEN}║${NC} %-20s : %-30s ${GREEN}║${NC}\n" "Log File" "$(basename $LOG_FILE)"
+    printf "${GREEN}║${NC} %-20s : %-30s ${GREEN}║${NC}\n" "Metrics File" "$(basename $METRICS_FILE)"
+    echo -e "${GREEN}╚════════════════════════════════════════════════════════╝${NC}\n"
+    
+    info "Full paths:"
+    info "  Results: $RESULT_FILE"
+    info "  Log: $LOG_FILE"
+    info "  Metrics: $METRICS_FILE"
+}
+
+# Usage information
+function show_usage {
+    cat << EOF
+Usage: $0 [OPTIONS]
+
+Options:
+    -h, --help              Show this help message
+    -i, --input PATH        Input HDFS path (default: $INPUT_PATH)
+    -k, --clusters NUM      Number of clusters (default: $NUM_CLUSTERS)
+    -n, --iterations NUM    Number of iterations (default: $NUM_ITERATIONS)
+    -m, --master URL        Spark master URL (default: $SPARK_MASTER)
+    --executor-mem SIZE     Executor memory (default: $EXECUTOR_MEMORY)
+    --driver-mem SIZE       Driver memory (default: $DRIVER_MEMORY)
+
+Environment Variables:
+    PROJECT_DIR             Project directory path
+    INPUT_PATH              Input file path in HDFS
+    NUM_CLUSTERS            Number of clusters
+    NUM_ITERATIONS          Number of iterations
+    SPARK_MASTER            Spark master URL
+
+Example:
+    $0 -k 5 -n 30 -i hdfs:///data/custom_dataset
+EOF
+}
+
+# Parse command line arguments
+function parse_args {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                show_usage
+                exit 0
+                ;;
+            -i|--input)
+                INPUT_PATH="$2"
+                shift 2
+                ;;
+            -k|--clusters)
+                NUM_CLUSTERS="$2"
+                shift 2
+                ;;
+            -n|--iterations)
+                NUM_ITERATIONS="$2"
+                shift 2
+                ;;
+            -m|--master)
+                SPARK_MASTER="$2"
+                shift 2
+                ;;
+            --executor-mem)
+                EXECUTOR_MEMORY="$2"
+                shift 2
+                ;;
+            --driver-mem)
+                DRIVER_MEMORY="$2"
+                shift 2
+                ;;
+            *)
+                error "Unknown option: $1"
+                show_usage
+                exit 1
+                ;;
+        esac
+    done
+}
+
+# Main execution flow
+function main {
+    print_banner
+    parse_args "$@"
+    
+    info "Starting K-Means Spark Runner..."
+    info "Log file: $LOG_FILE"
+    
+    check_prerequisites
+    check_hdfs
+    validate_input
+    build_project
+    
+    if run_spark_job && process_results; then
+        print_summary
+        success "Pipeline completed successfully! 🎉"
+        exit 0
+    else
+        error "Pipeline failed. Check logs for details"
+        exit 1
+    fi
+}
+
+# Run main function with all arguments
+main "$@"
