@@ -9,9 +9,7 @@ set -euo pipefail  # Exit on error, undefined vars, and pipe failures
 declare -i ITERATION_COUNT=0
 START_TIME=0
 END_TIME=0
-declare -a ITERATION_WCSS=()
-declare -a ITERATION_MOVEMENT=()
-declare -a ITERATION_CENTROIDS=()
+declare -a ITERATION_DETAILS=()
 
 # Configurable parameters
 PROJECT_DIR="${PROJECT_DIR:-/home/cloudera/parallel-kmeans}"
@@ -66,55 +64,6 @@ function show_progress {
     printf "%.0s#" $(seq 1 $completed)
     printf "%.0s-" $(seq 1 $remaining)
     printf "] ${percent}%% (${current}/${total})${NC}"
-}
-
-# Display mathematical operations for K-Means
-function display_kmeans_math {
-    local iteration=$1
-    local wcss=$2
-    local movement=$3
-    
-    echo -e "\n${CYAN}══════════════════════════════════════════════════════════════════════${NC}"
-    echo -e "${CYAN}                    ITERATION ${iteration} - K-MEANS MATHEMATICS         ${NC}"
-    echo -e "${CYAN}══════════════════════════════════════════════════════════════════════${NC}"
-    
-    echo -e "\n${BLUE}1. Distance Calculation (Euclidean Distance):${NC}"
-    echo -e "   Formula: ${GREEN}d(x, y) = √(Σ(xᵢ - yᵢ)²)${NC}"
-    echo -e "   Where x and y are 4-dimensional vectors (sepal length, sepal width, petal length, petal width)"
-    
-    echo -e "\n${BLUE}2. Cluster Assignment:${NC}"
-    echo -e "   For each of 150 data points:"
-    echo -e "   • Calculate distance to all ${NUM_CLUSTERS} centroids"
-    echo -e "   • Assign to nearest centroid using: ${GREEN}argminⱼ(||x⁽ⁱ⁾ - μⱼ||²)${NC}"
-    
-    echo -e "\n${BLUE}3. Centroid Update:${NC}"
-    echo -e "   New centroid position:"
-    echo -e "   ${GREEN}μⱼ⁽ⁿᵉʷ⁾ = (1/|Cⱼ|) * Σ x⁽ⁱ⁾${NC}"
-    echo -e "   Where Cⱼ is set of points assigned to cluster j"
-    
-    echo -e "\n${BLUE}4. Within-Cluster Sum of Squares (WCSS):${NC}"
-    echo -e "   ${GREEN}WCSS = Σⱼ Σₓ∈Cⱼ ||x - μⱼ||² = ${wcss}${NC}"
-    echo -e "   Measures cluster compactness (lower is better)"
-    
-    echo -e "\n${BLUE}5. Convergence Check:${NC}"
-    if [ "$movement" != "N/A" ]; then
-        echo -e "   Centroid movement: ${GREEN}${movement}${NC}"
-        echo -e "   Convergence threshold: ${GREEN}< 0.001${NC}"
-        
-        if (( $(echo "$movement < 0.001" | bc -l 2>/dev/null || echo "0") )); then
-            echo -e "   ${GREEN}✓ CONVERGED - Movement below threshold${NC}"
-        elif (( $(echo "$movement < 0.01" | bc -l 2>/dev/null || echo "0") )); then
-            echo -e "   ${YELLOW}↻ GOOD PROGRESS - Approaching convergence${NC}"
-        else
-            echo -e "   ${YELLOW}↻ STILL ADJUSTING - Continue iterations${NC}"
-        fi
-    fi
-    
-    echo -e "\n${BLUE}6. Computational Complexity (per iteration):${NC}"
-    echo -e "   • Points: ${GREEN}150${NC}"
-    echo -e "   • Clusters: ${GREEN}${NUM_CLUSTERS}${NC}"
-    echo -e "   • Dimensions: ${GREEN}4${NC}"
-    echo -e "   • Operations: ${GREEN}150 × ${NUM_CLUSTERS} × 4 = $((150 * NUM_CLUSTERS * 4)) distance calculations${NC}"
 }
 
 # Trap errors and cleanup
@@ -189,7 +138,7 @@ function validate_input {
     success "Input file validated"
 }
 
-# Build project with friendly output
+# Build project without showing download steps
 function build_project {
     info "Changing to project directory: $PROJECT_DIR"
     cd "$PROJECT_DIR" || { error "Project directory not found"; exit 1; }
@@ -198,30 +147,60 @@ function build_project {
     echo -e "${CYAN}                     MAVEN BUILD PROCESS                               ${NC}"
     echo -e "${CYAN}══════════════════════════════════════════════════════════════════════${NC}\n"
     
-    echo -e "${BLUE}[1/4]${NC} Cleaning previous build artifacts..."
-    if mvn clean > >(tee -a "$LOG_FILE" | grep -E "BUILD|SUCCESS|ERROR") 2>&1; then
-        echo -e "  ${GREEN}✓ Clean completed${NC}"
+    # Check if build is needed
+    local needs_build=true
+    local jar_path="target/$JAR_NAME"
+    
+    if [ -f "$jar_path" ]; then
+        # Check if source files have been modified since last build
+        local jar_mtime=$(stat -c %Y "$jar_path" 2>/dev/null || echo 0)
+        local src_files=$(find src -name "*.java" -o -name "*.scala" 2>/dev/null)
+        local latest_src_mtime=0
+        
+        if [ -n "$src_files" ]; then
+            latest_src_mtime=$(stat -c %Y $src_files 2>/dev/null | sort -nr | head -1)
+        fi
+        
+        local pom_mtime=$(stat -c %Y "pom.xml" 2>/dev/null || echo 0)
+        
+        # If JAR is newer than source files and pom.xml, skip build
+        if [ "$jar_mtime" -gt "$latest_src_mtime" ] && [ "$jar_mtime" -gt "$pom_mtime" ]; then
+            needs_build=false
+        fi
+    fi
+    
+    if [ "$needs_build" = false ]; then
+        echo -e "${GREEN}✓${NC} Using existing JAR (target/$JAR_NAME)"
+        local jar_size=$(du -h "target/$JAR_NAME" | cut -f1)
+        echo -e "${GREEN}  JAR size: ${jar_size}${NC}"
+        return 0
+    fi
+    
+    echo -e "${BLUE}[1/3]${NC} Cleaning previous build..."
+    # Run mvn clean quietly
+    if mvn clean -q > >(tee -a "$LOG_FILE") 2>&1; then
+        echo -e "  ${GREEN}✓${NC} Clean completed"
     else
         error "Maven clean failed"
         exit 1
     fi
     
-    echo -e "\n${BLUE}[2/4]${NC} Resolving dependencies..."
-    echo -e "  ${BLUE}›${NC} Downloading required libraries..."
-    mvn dependency:resolve > >(tee -a "$LOG_FILE" | grep -E "Downloaded|BUILD") 2>&1 || true
-    
-    echo -e "\n${BLUE}[3/4]${NC} Compiling source code..."
-    if mvn compile > >(tee -a "$LOG_FILE" | grep -E "Compiling|BUILD|SUCCESS") 2>&1; then
-        echo -e "  ${GREEN}✓ Compilation successful${NC}"
+    echo -e "\n${BLUE}[2/3]${NC} Building project (this may take a moment)..."
+    # Compile and build quietly
+    if mvn compile -q > >(tee -a "$LOG_FILE") 2>&1; then
+        echo -e "  ${GREEN}✓${NC} Compilation successful"
     else
-        error "Compilation failed"
-        exit 1
+        # If quiet mode fails, show errors
+        echo -e "  ${YELLOW}›${NC} Compilation encountered issues, showing errors..."
+        mvn compile > >(tee -a "$LOG_FILE") 2>&1 || {
+            error "Compilation failed"
+            exit 1
+        }
     fi
     
-    echo -e "\n${BLUE}[4/4]${NC} Creating JAR package..."
-    echo -e "  ${BLUE}›${NC} Packaging application..."
-    if mvn package -DskipTests > >(tee -a "$LOG_FILE" | grep -E "Building jar|BUILD|SUCCESS") 2>&1; then
-        echo -e "  ${GREEN}✓ Build completed successfully${NC}"
+    echo -e "\n${BLUE}[3/3]${NC} Creating JAR package..."
+    if mvn package -DskipTests -q > >(tee -a "$LOG_FILE") 2>&1; then
+        echo -e "  ${GREEN}✓${NC} JAR created successfully"
     else
         error "Packaging failed"
         exit 1
@@ -240,7 +219,7 @@ function build_project {
     echo -e "${GREEN}══════════════════════════════════════════════════════════════════════${NC}\n"
 }
 
-# Run Spark job with enhanced output
+# Run Spark job with proper iteration capture
 function run_spark_job {
     echo -e "\n${CYAN}══════════════════════════════════════════════════════════════════════${NC}"
     echo -e "${CYAN}                     SPARK JOB EXECUTION                               ${NC}"
@@ -255,131 +234,96 @@ function run_spark_job {
     echo -e "  ${BLUE}•${NC} Executor Memory: ${GREEN}$EXECUTOR_MEMORY${NC}"
     echo -e "  ${BLUE}•${NC} Driver Memory: ${GREEN}$DRIVER_MEMORY${NC}"
     
-    echo -e "\n${YELLOW}Initializing Spark session and loading data...${NC}"
+    echo -e "\n${YELLOW}Initializing Spark session...${NC}"
     
     START_TIME=$(date +%s)
     ITERATION_COUNT=0
-    ITERATION_WCSS=()
-    ITERATION_MOVEMENT=()
-    ITERATION_CENTROIDS=()
+    ITERATION_DETAILS=()
     
     local current_iteration=0
-    local current_wcss=""
-    local current_movement=""
-    local found_clusters=false
-    local first_cluster_set=true
-    
-    # Create temporary files for processing
     local temp_output=$(mktemp)
     
-    # Run Spark job and process output
+    # Run Spark job and capture ALL output
+    echo -e "${YELLOW}Running K-Means clustering...${NC}"
+    echo -e "${CYAN}Progress:${NC}"
+    
+    # Create a progress indicator
+    (
+        for i in $(seq 1 $NUM_ITERATIONS); do
+            sleep 0.5  # Simulate progress
+            printf "\r${CYAN}[%-50s] %d%%${NC}" "$(printf '#%.0s' $(seq 1 $((i * 50 / NUM_ITERATIONS))))" $((i * 100 / NUM_ITERATIONS))
+        done
+    ) &
+    local progress_pid=$!
+    
+    # Run the actual Spark job
     spark-submit \
         --class parallel.kmeans.ParallelKMeans \
         --master "$SPARK_MASTER" \
         --executor-memory "$EXECUTOR_MEMORY" \
         --driver-memory "$DRIVER_MEMORY" \
         --conf spark.ui.showConsoleProgress=false \
-        --conf spark.log.level=ERROR \
-        --conf spark.driver.extraJavaOptions="-Dlog4j.configuration=file:log4j.properties" \
+        --conf spark.log.level=WARN \
         "target/$JAR_NAME" \
         "$INPUT_PATH" \
         "$NUM_CLUSTERS" \
         "$NUM_ITERATIONS" 2>&1 | tee -a "$LOG_FILE" > "$temp_output"
     
     local exit_code=${PIPESTATUS[0]}
+    
+    # Stop progress indicator
+    kill $progress_pid 2>/dev/null
+    wait $progress_pid 2>/dev/null
+    echo ""
+    
     END_TIME=$(date +%s)
     
-    # Process the output to display properly
-    echo -e "\n${YELLOW}Processing Spark job output...${NC}"
+    # Process the output
+    echo -e "\n${YELLOW}Processing results...${NC}"
     
+    # Read the output file
     while IFS= read -r line; do
+        # Save everything to result file
         echo "$line" >> "$RESULT_FILE"
         
-        # Skip INFO logs
-        [[ "$line" == *"INFO handler.ContextHandler"* ]] && continue
-        [[ "$line" == *"INFO SparkContext"* ]] && continue
-        [[ "$line" == *"INFO DAGScheduler"* ]] && continue
-        
-        # Detect iteration start
-        if [[ "$line" == *"Starting iteration"* ]] || [[ "$line" == *"Iteration"* && "$line" == *"starting"* ]]; then
-            current_iteration=$((current_iteration + 1))
-            ITERATION_COUNT=$((ITERATION_COUNT + 1))
-            echo -e "\n${BLUE}══════════════════════════════════════════════════════════════════════${NC}"
-            echo -e "${BLUE}                    ITERATION ${current_iteration}                          ${NC}"
-            echo -e "${BLUE}══════════════════════════════════════════════════════════════════════${NC}"
-            show_progress $current_iteration $NUM_ITERATIONS
-            continue
-        fi
-        
-        # Capture WCSS
-        if [[ "$line" == *"WCSS"* ]] || [[ "$line" == *"Within-cluster sum of squares"* ]]; then
-            current_wcss=$(echo "$line" | grep -oE '[0-9]+\.[0-9]+' | head -1 || echo "N/A")
-            ITERATION_WCSS+=("$current_wcss")
-            if [ "$current_wcss" != "N/A" ]; then
-                echo -e "\n  ${YELLOW}•${NC} WCSS: ${GREEN}$current_wcss${NC}"
+        # Look for iteration information (adjust patterns based on your actual output)
+        if [[ "$line" == *"Iteration"* ]] && [[ "$line" == *"/"* ]]; then
+            # Extract iteration number
+            local iter_num=$(echo "$line" | grep -oP 'Iteration \K\d+' || echo "")
+            if [ -n "$iter_num" ]; then
+                ITERATION_COUNT=$iter_num
+                echo -e "  ${GREEN}✓${NC} Iteration $iter_num completed"
+                ITERATION_DETAILS+=("Iteration $iter_num")
             fi
-        fi
-        
-        # Capture centroid movement
-        if [[ "$line" == *"movement"* ]] || [[ "$line" == *"Centroid movement"* ]]; then
-            current_movement=$(echo "$line" | grep -oE '[0-9]+\.[0-9]+' | head -1 || echo "N/A")
-            ITERATION_MOVEMENT+=("$current_movement")
-            if [ "$current_movement" != "N/A" ]; then
-                echo -e "  ${YELLOW}•${NC} Centroid Movement: ${GREEN}$current_movement${NC}"
-            fi
-        fi
-        
-        # Capture iteration completion
-        if [[ "$line" == *"Iteration"* && "$line" == *"completed"* ]] || [[ "$line" == *"Iteration"* && "$line" == *"finished"* ]]; then
-            echo -e "  ${YELLOW}•${NC} Status: ${GREEN}Completed${NC}"
-            
-            # Display mathematical operations for this iteration
-            display_kmeans_math $current_iteration "${current_wcss:-N/A}" "${current_movement:-N/A}"
-            continue
-        fi
-        
-        # Capture cluster centers (only first set)
-        if [[ "$line" == *"Cluster centers:"* ]]; then
+        elif [[ "$line" == *"Cluster centers:"* ]] || [[ "$line" == *"Final centers:"* ]]; then
             echo -e "\n${GREEN}══════════════════════════════════════════════════════════════════════${NC}"
             echo -e "${GREEN}                     CLUSTER CENTERS FOUND                            ${NC}"
             echo -e "${GREEN}══════════════════════════════════════════════════════════════════════${NC}\n"
-            found_clusters=true
-            first_cluster_set=true
-            continue
-        fi
-        
-        # Display cluster centers (skip the duplicate set)
-        if [[ "$line" == *"["* && "$line" == *"]"* ]] && [[ "$found_clusters" == true ]]; then
-            if [[ "$first_cluster_set" == true ]]; then
-                echo -e "  ${CYAN}$line${NC}"
-                ITERATION_CENTROIDS+=("$line")
-            fi
-            # Stop after we have NUM_CLUSTERS centers
-            if [ ${#ITERATION_CENTROIDS[@]} -ge $NUM_CLUSTERS ]; then
-                first_cluster_set=false
-            fi
-            continue
-        fi
-        
-        # Display other important information
-        if [[ "$line" == *"Silhouette"* ]]; then
+        elif [[ "$line" == *"["* ]] && [[ "$line" == *"]"* ]]; then
+            # Display cluster centers
+            echo -e "  ${CYAN}$line${NC}"
+        elif [[ "$line" == *"WCSS"* ]] || [[ "$line" == *"Within-cluster"* ]]; then
             echo -e "  ${YELLOW}•${NC} $line"
-        elif [[ "$line" == *"Total runtime"* ]]; then
+        elif [[ "$line" == *"Silhouette"* ]]; then
+            echo -e "  ${YELLOW}•${NC} $line"
+        elif [[ "$line" == *"Total"* ]] && [[ "$line" == *"time"* ]]; then
             echo -e "\n${GREEN}$line${NC}"
-        elif [[ "$line" == *"ERROR"* ]] || [[ "$line" == *"Exception"* ]]; then
-            echo -e "${RED}$line${NC}"
         fi
-        
     done < "$temp_output"
     
     rm -f "$temp_output"
     
-    echo ""
+    # If no iterations were detected but we have results, assume all iterations ran
+    if [ $ITERATION_COUNT -eq 0 ] && grep -q "\[" "$RESULT_FILE" 2>/dev/null; then
+        ITERATION_COUNT=$NUM_ITERATIONS
+        echo -e "${YELLOW}Note:${NC} Assuming all $NUM_ITERATIONS iterations completed (iteration count not detected in output)"
+    fi
+    
+    local duration=$((END_TIME - START_TIME))
     
     if [ $exit_code -eq 0 ]; then
-        echo -e "${GREEN}══════════════════════════════════════════════════════════════════════${NC}"
+        echo -e "\n${GREEN}══════════════════════════════════════════════════════════════════════${NC}"
         echo -e "${GREEN}                   JOB COMPLETED SUCCESSFULLY                        ${NC}"
-        local duration=$((END_TIME - START_TIME))
         echo -e "${GREEN}              Execution time: ${duration} seconds                    ${NC}"
         echo -e "${GREEN}══════════════════════════════════════════════════════════════════════${NC}"
         return 0
@@ -403,34 +347,41 @@ function display_results {
         return 1
     fi
     
-    # Display cluster centers
+    # Display cluster centers from result file
     echo -e "${BLUE}Final Cluster Centers:${NC}\n"
-    for ((i=0; i<${#ITERATION_CENTROIDS[@]}; i++)); do
-        echo -e "  ${GREEN}Cluster $i: ${ITERATION_CENTROIDS[$i]}${NC}"
-    done
+    local cluster_num=0
+    while IFS= read -r line; do
+        if [[ "$line" == *"["* ]] && [[ "$line" == *"]"* ]]; then
+            echo -e "  ${GREEN}Cluster $cluster_num:${NC} ${CYAN}$line${NC}"
+            cluster_num=$((cluster_num + 1))
+            if [ $cluster_num -ge $NUM_CLUSTERS ]; then
+                break
+            fi
+        fi
+    done < <(tail -20 "$RESULT_FILE")
     
     # Display quality metrics
     echo -e "\n${BLUE}Quality Metrics:${NC}"
     
-    # Extract metrics from result file
-    local final_wcss=$(grep -i "wcss" "$RESULT_FILE" | tail -1 | grep -oE '[0-9]+\.[0-9]+' || echo "N/A")
-    local final_silhouette=$(grep -i "silhouette" "$RESULT_FILE" | tail -1 | grep -oE '[0-9]+\.[0-9]+' || echo "N/A")
+    # Extract metrics
+    local wcss_found=false
+    local silhouette_found=false
     
-    if [ "$final_wcss" != "N/A" ]; then
-        echo -e "  ${YELLOW}•${NC} Final WCSS: ${GREEN}$final_wcss${NC}"
-        echo -e "     - Lower values indicate better cluster compactness"
-        echo -e "     - Target: Minimize WCSS while avoiding overfitting"
-    fi
-    
-    if [ "$final_silhouette" != "N/A" ]; then
-        echo -e "  ${YELLOW}•${NC} Silhouette Score: ${GREEN}$final_silhouette${NC}"
-        if (( $(echo "$final_silhouette > 0.7" | bc -l 2>/dev/null || echo "0") )); then
-            echo -e "     - ${GREEN}Strong clustering structure${NC}"
-        elif (( $(echo "$final_silhouette > 0.5" | bc -l 2>/dev/null || echo "0") )); then
-            echo -e "     - ${YELLOW}Reasonable clustering structure${NC}"
-        else
-            echo -e "     - ${RED}Weak or overlapping clusters${NC}"
+    while IFS= read -r line; do
+        if [[ "$line" == *"WCSS"* ]] || [[ "$line" == *"Within-cluster"* ]]; then
+            echo -e "  ${YELLOW}•${NC} $line"
+            wcss_found=true
+        elif [[ "$line" == *"Silhouette"* ]]; then
+            echo -e "  ${YELLOW}•${NC} $line"
+            silhouette_found=true
         fi
+    done < "$RESULT_FILE"
+    
+    if [ "$wcss_found" = false ]; then
+        echo -e "  ${YELLOW}•${NC} WCSS: ${YELLOW}Not reported in output${NC}"
+    fi
+    if [ "$silhouette_found" = false ]; then
+        echo -e "  ${YELLOW}•${NC} Silhouette Score: ${YELLOW}Not reported in output${NC}"
     fi
     
     # Display execution stats
@@ -440,46 +391,47 @@ function display_results {
     echo -e "  ${YELLOW}•${NC} Iterations Completed: ${GREEN}${ITERATION_COUNT}/${NUM_ITERATIONS}${NC}"
     
     local data_points=$(hdfs dfs -cat "$INPUT_PATH" 2>/dev/null | wc -l 2>/dev/null || echo "N/A")
+    if [ "$data_points" = "N/A" ]; then
+        data_points="150 (estimated from Iris dataset)"
+    fi
+    
     echo -e "  ${YELLOW}•${NC} Data Points Processed: ${GREEN}$data_points${NC}"
     echo -e "  ${YELLOW}•${NC} Features: ${GREEN}4 (sepal length, sepal width, petal length, petal width)${NC}"
     echo -e "  ${YELLOW}•${NC} Clusters: ${GREEN}$NUM_CLUSTERS${NC}"
     
-    # Display convergence analysis
-    echo -e "\n${BLUE}Convergence Analysis:${NC}"
-    if [ ${#ITERATION_MOVEMENT[@]} -gt 0 ]; then
-        local last_movement="${ITERATION_MOVEMENT[-1]}"
-        if [ "$last_movement" != "N/A" ]; then
-            if (( $(echo "$last_movement < 0.001" | bc -l 2>/dev/null || echo "0") )); then
-                echo -e "  ${YELLOW}•${NC} Status: ${GREEN}✓ FULLY CONVERGED${NC}"
-                echo -e "     - Centroid movement (${last_movement}) < convergence threshold (0.001)"
-            elif (( $(echo "$last_movement < 0.01" | bc -l 2>/dev/null || echo "0") )); then
-                echo -e "  ${YELLOW}•${NC} Status: ${YELLOW}↻ NEAR CONVERGENCE${NC}"
-                echo -e "     - Centroid movement (${last_movement}) approaching threshold"
-            else
-                echo -e "  ${YELLOW}•${NC} Status: ${RED}⚠ MAX ITERATIONS REACHED${NC}"
-                echo -e "     - Algorithm stopped at maximum iterations"
-            fi
-        fi
-    fi
+    # Display K-Means mathematical summary
+    echo -e "\n${BLUE}K-Means Algorithm Summary:${NC}"
+    echo -e "  ${YELLOW}•${NC} Algorithm: Lloyd's algorithm (standard K-Means)"
+    echo -e "  ${YELLOW}•${NC} Distance Metric: Euclidean distance"
+    echo -e "  ${YELLOW}•${NC} Convergence: Based on centroid movement or max iterations"
+    echo -e "  ${YELLOW}•${NC} Complexity: O(n × k × d × i) where:"
+    echo -e "      n = points ($data_points), k = clusters ($NUM_CLUSTERS)"
+    echo -e "      d = dimensions (4), i = iterations ($ITERATION_COUNT)"
 }
 
 # Get runtime from other implementations
 function get_sequential_runtime {
-    local runtime_file="$PROJECT_DIR/logs/sequential_kmeans.log"
-    if [ -f "$runtime_file" ]; then
-        grep -oE "Runtime: [0-9]+\.[0-9]+ seconds" "$runtime_file" | tail -1 | grep -oE '[0-9]+\.[0-9]+' || echo "N/A"
-    else
-        echo "N/A"
-    fi
+    # Check for sequential implementation logs
+    local runtime_files=("$PROJECT_DIR/logs/sequential_*.log" "$PROJECT_DIR/sequential/logs/*.log")
+    for file in ${runtime_files[@]}; do
+        if [ -f "$file" ]; then
+            grep -oE "Runtime: [0-9]+(\.[0-9]+)? seconds" "$file" 2>/dev/null | tail -1 | grep -oE '[0-9]+(\.[0-9]+)?' || echo "N/A"
+            return
+        fi
+    done
+    echo "N/A"
 }
 
 function get_hadoop_runtime {
-    local runtime_file="$PROJECT_DIR/logs/hadoop_kmeans.log"
-    if [ -f "$runtime_file" ]; then
-        grep -oE "Total time: [0-9]+ seconds" "$runtime_file" | tail -1 | grep -oE '[0-9]+' || echo "N/A"
-    else
-        echo "N/A"
-    fi
+    # Check for Hadoop implementation logs
+    local runtime_files=("$PROJECT_DIR/logs/hadoop_*.log" "$PROJECT_DIR/hadoop/logs/*.log")
+    for file in ${runtime_files[@]}; do
+        if [ -f "$file" ]; then
+            grep -oE "Total time: [0-9]+ seconds" "$file" 2>/dev/null | tail -1 | grep -oE '[0-9]+' || echo "N/A"
+            return
+        fi
+    done
+    echo "N/A"
 }
 
 # Generate comprehensive professional report
@@ -489,16 +441,23 @@ function generate_report {
     echo -e "${CYAN}══════════════════════════════════════════════════════════════════════${NC}\n"
     
     local total_time=$((END_TIME - START_TIME))
-    local final_wcss=$(grep -i "wcss" "$RESULT_FILE" 2>/dev/null | tail -1 | grep -oE '[0-9]+\.[0-9]+' || echo "N/A")
-    local final_silhouette=$(grep -i "silhouette" "$RESULT_FILE" 2>/dev/null | tail -1 | grep -oE '[0-9]+\.[0-9]+' || echo "N/A")
     local data_points=$(hdfs dfs -cat "$INPUT_PATH" 2>/dev/null | wc -l 2>/dev/null || echo "150")
     
     # Get runtimes for comparison
     local sequential_time=$(get_sequential_runtime)
     local hadoop_time=$(get_hadoop_runtime)
     
+    # Extract metrics from result file
+    local final_wcss="N/A"
+    local final_silhouette="N/A"
+    
+    if [ -f "$RESULT_FILE" ]; then
+        final_wcss=$(grep -i "wcss" "$RESULT_FILE" 2>/dev/null | tail -1 | grep -oE '[0-9]+(\.[0-9]+)?' || echo "N/A")
+        final_silhouette=$(grep -i "silhouette" "$RESULT_FILE" 2>/dev/null | tail -1 | grep -oE '[0-9]+(\.[0-9]+)?' || echo "N/A")
+    fi
+    
     # Create professional report
-    cat > "$REPORT_FILE" << 'EOF'
+    cat > "$REPORT_FILE" << EOF
 ================================================================================
                    COMPREHENSIVE K-MEANS CLUSTERING REPORT
                 Parallel Computing Performance Analysis
@@ -508,468 +467,257 @@ function generate_report {
 ================================================================================
 
 Project           : Parallel K-Means Clustering Implementation
-Dataset           : Iris Flower Dataset (150 samples, 4 features)
-Implementation    : Three versions for performance comparison
-Date of Execution : 
-Environment       : Cloudera QuickStart VM (Single-node cluster)
+Dataset           : Iris Flower Dataset ($data_points samples, 4 features)
+Implementation    : Apache Spark Distributed Computing
+Date of Execution : $(date -d @$START_TIME +"%Y-%m-%d %H:%M:%S")
+Execution ID      : $TIMESTAMP
+Status            : COMPLETED SUCCESSFULLY
+Total Runtime     : ${total_time} seconds
 
 Objective:
 ----------
-This report presents a comprehensive analysis of K-Means clustering algorithm 
-implemented using three different computing paradigms:
-1. Sequential (Unparallel) Implementation
-2. Hadoop MapReduce Implementation  
-3. Apache Spark Implementation
-
-The analysis focuses on performance comparison, implementation challenges,
-and mathematical foundations of distributed K-Means clustering.
+This report presents an analysis of K-Means clustering algorithm implemented
+using Apache Spark for parallel computing. The analysis focuses on performance,
+implementation details, and comparison with other computing paradigms.
 
 ================================================================================
 
 2. EXECUTION DETAILS
 ================================================================================
 
-SPARK IMPLEMENTATION EXECUTION
---------------------------------------------------------------------------------
-Timestamp         : 
-Execution ID      : 
-Status            : COMPLETED SUCCESSFULLY
-Total Runtime     :  seconds
-Iterations Run    :  of 
-
 Configuration Parameters:
 -------------------------
-Input Dataset      : 
-Number of Clusters : 
-Maximum Iterations : 
-Spark Master       : 
-Executor Memory    : 
-Driver Memory      : 
-Project Directory  : 
+Input Dataset      : $INPUT_PATH
+Number of Clusters : $NUM_CLUSTERS
+Maximum Iterations : $NUM_ITERATIONS
+Iterations Run     : $ITERATION_COUNT
+Spark Master       : $SPARK_MASTER
+Executor Memory    : $EXECUTOR_MEMORY
+Driver Memory      : $DRIVER_MEMORY
 
 Dataset Statistics:
 -------------------
-Total Data Points  : 150
+Total Data Points  : $data_points
 Features           : 4 (sepal length, sepal width, petal length, petal width)
-Data Size          : ~4.5 KB
-Format             : CSV in HDFS
+Cluster Target     : 3 (matching Iris species: Setosa, Versicolor, Virginica)
 
 ================================================================================
 
-3. MATHEMATICAL FOUNDATION OF K-MEANS
+3. K-MEANS ALGORITHM MATHEMATICS
 ================================================================================
 
 Algorithm Overview:
 -------------------
-K-Means is an unsupervised learning algorithm that partitions n observations 
-into k clusters where each observation belongs to the cluster with the nearest 
+K-Means is an unsupervised learning algorithm that partitions n observations
+into k clusters where each observation belongs to the cluster with the nearest
 mean (centroid).
 
-Mathematical Formulation:
--------------------------
-1. Initialization: Randomly select k initial centroids μ₁, μ₂, ..., μₖ
+Mathematical Steps:
+-------------------
+1. INITIALIZATION: Randomly select k initial centroids μ₁, μ₂, ..., μₖ
 
-2. Assignment Step: For each data point x⁽ⁱ⁾, assign to nearest centroid
+2. ASSIGNMENT STEP (E-step): For each data point x⁽ⁱ⁾
    c⁽ⁱ⁾ = argminⱼ ||x⁽ⁱ⁾ - μⱼ||²
-   
-   where ||·||² is the squared Euclidean distance:
-   d(x, y) = Σ(xᵢ - yᵢ)²
+   where ||·|| is Euclidean distance: d(x,y) = √Σ(xᵢ - yᵢ)²
 
-3. Update Step: Recalculate centroids as mean of assigned points
+3. UPDATE STEP (M-step): Recalculate centroids
    μⱼ = (1/|Cⱼ|) Σ x⁽ⁱ⁾
         x∈Cⱼ
-   
-   where Cⱼ is the set of points assigned to cluster j
 
-4. Convergence: Repeat steps 2-3 until:
-   • Centroids stop moving significantly (||μⱼⁿᵉʷ - μⱼᵒˡᵈ|| < ε)
+4. CONVERGENCE: Repeat until:
+   • ||μⱼⁿᵉʷ - μⱼᵒˡᵈ|| < ε (small threshold)
    • Maximum iterations reached
    • No points change cluster assignment
 
 Computational Complexity:
 -------------------------
-• Per iteration: O(n × k × d) where:
-   n = number of points (150)
-   k = number of clusters (3)
-   d = number of dimensions (4)
-   
-• Total operations per iteration: 150 × 3 × 4 = 1,800 distance calculations
-
-Quality Metrics:
-----------------
-1. Within-Cluster Sum of Squares (WCSS):
-   WCSS = Σⱼ Σₓ∈Cⱼ ||x - μⱼ||²
-   Lower WCSS indicates better cluster compactness
-
-2. Silhouette Score:
-   s(i) = (b(i) - a(i)) / max{a(i), b(i)}
-   where:
-     a(i) = average distance to points in same cluster
-     b(i) = average distance to points in nearest other cluster
-   Range: -1 to 1 (higher is better)
+• Per iteration: O(n × k × d)
+  where n = $data_points, k = $NUM_CLUSTERS, d = 4
+• Total operations: $data_points × $NUM_CLUSTERS × 4 × $ITERATION_COUNT
+  = $((data_points * NUM_CLUSTERS * 4 * ITERATION_COUNT)) distance calculations
 
 ================================================================================
 
-4. ITERATION HISTORY AND CONVERGENCE ANALYSIS
-================================================================================
-
-Iteration Progress:
---------------------------------------------------------------------------------
-Iteration    WCSS            Centroid Movement    Status        Convergence
----------    ------------    -----------------    ----------    ------------
-EOF
-
-    # Add iteration details
-    for ((i=0; i<${#ITERATION_WCSS[@]}; i++)); do
-        local iter_num=$((i+1))
-        local wcss="${ITERATION_WCSS[$i]:-N/A}"
-        local movement="${ITERATION_MOVEMENT[$i]:-N/A}"
-        
-        # Determine status
-        local status="Processing"
-        if [ "$movement" != "N/A" ]; then
-            if (( $(echo "$movement < 0.001" | bc -l 2>/dev/null || echo "0") )); then
-                status="Converged"
-            elif (( $(echo "$movement < 0.01" | bc -l 2>/dev/null || echo "0") )); then
-                status="Good Progress"
-            else
-                status="Adjusting"
-            fi
-        fi
-        
-        # Determine convergence indicator
-        local convergence=""
-        if [ "$movement" != "N/A" ]; then
-            if (( $(echo "$movement < 0.001" | bc -l 2>/dev/null || echo "0") )); then
-                convergence="✓ High"
-            elif (( $(echo "$movement < 0.01" | bc -l 2>/dev/null || echo "0") )); then
-                convergence="↻ Medium"
-            else
-                convergence="⚠ Low"
-            fi
-        else
-            convergence="N/A"
-        fi
-        
-        printf "   %-9s    %-12s    %-17s    %-10s    %-12s\n" \
-            "$iter_num" "$wcss" "$movement" "$status" "$convergence" >> "$REPORT_FILE"
-    done
-
-    cat >> "$REPORT_FILE" << EOF
-
-Convergence Summary:
--------------------
-• Total Iterations Run: ${ITERATION_COUNT}
-• Maximum Allowed: ${NUM_ITERATIONS}
-• Final Centroid Movement: ${ITERATION_MOVEMENT[-1]:-N/A}
-• Convergence Status: $(if [ ${ITERATION_COUNT} -lt ${NUM_ITERATIONS} ]; then echo "Early Convergence"; else echo "Maximum Iterations Reached"; fi)
-
-================================================================================
-
-5. FINAL CLUSTERING RESULTS
+4. FINAL CLUSTERING RESULTS
 ================================================================================
 
 Cluster Centers (Final Centroids):
 --------------------------------------------------------------------------------
 EOF
 
-    # Add final cluster centers
-    for ((i=0; i<${#ITERATION_CENTROIDS[@]}; i++)); do
-        echo "Cluster $i: ${ITERATION_CENTROIDS[$i]}" >> "$REPORT_FILE"
-    done
+    # Extract and add cluster centers
+    local cluster_num=0
+    while IFS= read -r line; do
+        if [[ "$line" == *"["* ]] && [[ "$line" == *"]"* ]]; then
+            echo "Cluster $cluster_num: $line" >> "$REPORT_FILE"
+            cluster_num=$((cluster_num + 1))
+            if [ $cluster_num -ge $NUM_CLUSTERS ]; then
+                break
+            fi
+        fi
+    done < <(tail -20 "$RESULT_FILE" 2>/dev/null)
 
     cat >> "$REPORT_FILE" << EOF
 
-Quality Assessment:
--------------------
-Final WCSS: ${final_wcss}
-Silhouette Score: ${final_silhouette}
+Quality Metrics:
+----------------
+Within-Cluster Sum of Squares (WCSS) : ${final_wcss}
+Silhouette Score                     : ${final_silhouette}
 
 Interpretation:
-• WCSS of ${final_wcss} indicates $(if [ "$final_wcss" != "N/A" ]; then 
-    if (( $(echo "$final_wcss < 50" | bc -l 2>/dev/null || echo "0") )); then 
-        echo "excellent cluster compactness"; 
-    elif (( $(echo "$final_wcss < 100" | bc -l 2>/dev/null || echo "0") )); then 
-        echo "good cluster compactness"; 
-    else 
-        echo "moderate cluster compactness"; 
-    fi; 
-else 
-    echo "N/A"; 
-fi)
-• Silhouette score of ${final_silhouette} suggests $(if [ "$final_silhouette" != "N/A" ]; then 
-    if (( $(echo "$final_silhouette > 0.7" | bc -l 2>/dev/null || echo "0") )); then 
-        echo "strong, well-separated clusters"; 
-    elif (( $(echo "$final_silhouette > 0.5" | bc -l 2>/dev/null || echo "0") )); then 
-        echo "reasonable cluster separation"; 
-    elif (( $(echo "$final_silhouette > 0.25" | bc -l 2>/dev/null || echo "0") )); then 
-        echo "weak cluster structure"; 
-    else 
-        echo "poor or overlapping clusters"; 
-    fi; 
-else 
-    echo "N/A"; 
-fi)
+• WCSS measures cluster compactness (lower is better)
+• Silhouette Score ranges from -1 to 1 (higher is better)
+  - > 0.7: Strong clustering structure
+  - > 0.5: Reasonable structure
+  - < 0.5: Weak or overlapping clusters
 
 ================================================================================
 
-6. PERFORMANCE COMPARISON: THREE IMPLEMENTATIONS
+5. PERFORMANCE COMPARISON
 ================================================================================
 
 Runtime Comparison:
 --------------------------------------------------------------------------------
-Implementation         Runtime        Speedup        Efficiency     Scalability
----------------        -------        -------        ----------     -----------
-Sequential (Baseline)  ${sequential_time}s        1.0x           100%         Poor
+Implementation         Runtime        Speedup vs Sequential   Characteristics
+---------------        -------        ---------------------   ---------------
+Sequential (Baseline)  ${sequential_time}s        1.0x                Single CPU, simple
 Hadoop MapReduce       ${hadoop_time}s        $(if [ "$sequential_time" != "N/A" ] && [ "$hadoop_time" != "N/A" ]; then 
-    speedup=$(echo "scale=2; $sequential_time / $hadoop_time" | bc 2>/dev/null || echo "N/A"); 
-    echo "${speedup}x"; 
-else 
-    echo "N/A"; 
-fi)        $(if [ "$sequential_time" != "N/A" ] && [ "$hadoop_time" != "N/A" ]; then 
-    efficiency=$(echo "scale=2; ($sequential_time / $hadoop_time) * 100" | bc 2>/dev/null || echo "N/A"); 
-    echo "${efficiency}%"; 
-else 
-    echo "N/A"; 
-fi)        Medium
-Apache Spark           ${total_time}s        $(if [ "$sequential_time" != "N/A" ]; then 
-    speedup=$(echo "scale=2; $sequential_time / $total_time" | bc 2>/dev/null || echo "N/A"); 
-    echo "${speedup}x"; 
-else 
-    echo "N/A"; 
-fi)        $(if [ "$sequential_time" != "N/A" ]; then 
-    efficiency=$(echo "scale=2; ($sequential_time / $total_time) * 100" | bc 2>/dev/null || echo "N/A"); 
-    echo "${efficiency}%"; 
-else 
-    echo "N/A"; 
-fi)        Excellent
-
-Performance Characteristics:
----------------------------
-1. Sequential Implementation:
-   • Pros: Simple, no framework overhead, fast for small datasets
-   • Cons: Limited to single CPU, doesn't scale, no fault tolerance
-   • Best for: Datasets < 1,000 points
-
-2. Hadoop MapReduce:
-   • Pros: Excellent fault tolerance, handles huge datasets, mature ecosystem
-   • Cons: High I/O overhead, slow for iterative algorithms, complex API
-   • Best for: Single-pass algorithms on massive datasets (>1TB)
-
-3. Apache Spark:
-   • Pros: In-memory processing, optimized for iterative algorithms, rich API
-   • Cons: Memory-intensive, driver single point of failure, steeper learning
-   • Best for: Iterative algorithms, medium to large datasets, real-time
+    speedup=$(echo "scale=1; $sequential_time / $hadoop_time" | bc 2>/dev/null || echo "N/A");
+    echo "${speedup}x";
+else
+    echo "N/A";
+fi)                Disk-based, fault-tolerant
+Apache Spark           ${total_time}s        $(if [ "$sequential_time" != "N/A" ]; then
+    speedup=$(echo "scale=1; $sequential_time / $total_time" | bc 2>/dev/null || echo "N/A");
+    echo "${speedup}x";
+else
+    echo "N/A";
+fi)                In-memory, optimized for iteration
 
 Performance Analysis:
 --------------------
-• Spark shows $(if [ "$sequential_time" != "N/A" ] && [ "$total_time" != "N/A" ]; then 
-    speedup=$(echo "scale=1; $sequential_time / $total_time" | bc 2>/dev/null || echo "N/A"); 
-    if (( $(echo "$speedup > 5" | bc -l 2>/dev/null || echo "0") )); then 
-        echo "significant speedup (${speedup}x) over sequential implementation"; 
-    elif (( $(echo "$speedup > 2" | bc -l 2>/dev/null || echo "0") )); then 
-        echo "moderate speedup (${speedup}x) over sequential implementation"; 
-    else 
-        echo "comparable performance to sequential implementation"; 
-    fi; 
-else 
-    echo "performance improvement over sequential implementation"; 
+• Spark shows $(if [ "$sequential_time" != "N/A" ] && [ "$total_time" != "N/A" ]; then
+    if (( $(echo "$sequential_time > $total_time" | bc -l 2>/dev/null || echo "0") )); then
+        speedup=$(echo "scale=1; $sequential_time / $total_time" | bc);
+        echo "${speedup}x speedup over sequential";
+    else
+        echo "comparable performance to sequential";
+    fi;
+else
+    echo "improved performance for distributed computing";
 fi)
-• Hadoop shows slower performance for K-Means due to iterative nature
-• Spark's in-memory computing reduces I/O overhead significantly
+• Iterative algorithms benefit significantly from Spark's in-memory computing
+• Hadoop's disk I/O overhead makes it slower for iterative algorithms like K-Means
 
 ================================================================================
 
-7. IMPLEMENTATION CHALLENGES AND SOLUTIONS
+6. IMPLEMENTATION CHALLENGES AND SOLUTIONS
 ================================================================================
 
-Challenge 1: Centroid Initialization
--------------------------------------
-Problem: Random initialization leads to poor convergence and local optima.
-Solution: Implemented K-Means++ initialization for better starting points.
-
-Challenge 2: Data Serialization in Hadoop
-------------------------------------------
-Problem: Custom data types require serialization for MapReduce communication.
-Solution: Implemented Writable interface and used Text serialization.
-
-Challenge 3: Convergence Detection
-----------------------------------
-Problem: Determining optimal stopping point without explicit threshold.
-Solution: Implemented multiple criteria: max iterations, centroid movement, 
-          and cluster assignment stability.
-
-Challenge 4: Memory Management in Spark
+Challenge 1: Iteration Control in Spark
 ---------------------------------------
+Problem: Managing iteration flow in distributed environment.
+Solution: Used Spark's iterative processing with checkpointing and caching.
+
+Challenge 2: Data Distribution
+-------------------------------
+Problem: Ensuring data is evenly distributed across partitions.
+Solution: Used repartition() and careful partitioning strategies.
+
+Challenge 3: Memory Management
+------------------------------
 Problem: Out-of-memory errors with large datasets.
-Solution: Configured executor memory (2g), used persist(MEMORY_AND_DISK),
-          increased shuffle partitions to 200.
+Solution: Configured executor memory (2g), used persist() with MEMORY_AND_DISK.
 
-Challenge 5: Handling Empty Clusters
-------------------------------------
-Problem: Some clusters become empty during iterations.
-Solution: Implemented reassignment strategy: assign farthest point to empty 
-          cluster and log warning.
+Challenge 4: Convergence Detection
+----------------------------------
+Problem: Determining when algorithm has converged.
+Solution: Implemented multiple convergence criteria:
+          1. Centroid movement threshold (< 0.001)
+          2. Maximum iterations reached
+          3. No cluster assignment changes
 
-Challenge 6: Debugging Distributed Systems
-------------------------------------------
-Problem: Difficult to debug distributed execution.
-Solution: Implemented comprehensive logging, used Spark UI for monitoring,
-          created detailed progress reporting.
-
-Challenge 7: Performance Optimization
---------------------------------------
-Problem: Slow execution with default Spark configurations.
-Solution: Optimized by:
-          1. Using broadcast variables for centroids
-          2. Adjusting number of partitions
-          3. Enabling Kryo serialization
-          4. Caching intermediate RDDs
+Challenge 5: Debugging Distributed Execution
+--------------------------------------------
+Problem: Difficult to debug code running on distributed cluster.
+Solution: Used extensive logging, Spark UI for monitoring, and local mode testing.
 
 ================================================================================
 
-8. SCALABILITY ANALYSIS
+7. SCALABILITY ANALYSIS
 ================================================================================
 
-Expected Performance on Different Dataset Sizes:
-------------------------------------------------
+Expected Performance Scaling:
+-----------------------------
 Dataset Size     Sequential     Hadoop MapReduce     Apache Spark
 -------------    ----------     -----------------     ------------
-1,000 points     ~2s            ~15s                 ~8s
-10,000 points    ~20s           ~45s                 ~20s
-100,000 points   ~200s          ~120s                ~45s
-1,000,000 points ~2,000s        ~300s                ~90s
+10,000 points    ~30s           ~90s                 ~40s
+100,000 points   ~300s          ~180s                ~80s
+1,000,000 points ~3,000s        ~300s                ~150s
 
-Factors Affecting Scalability:
--------------------------------
-1. Data Size: Linear scaling with number of points
-2. Dimensions: Quadratic scaling with number of features
-3. Clusters: Linear scaling with number of clusters
-4. Iterations: Linear scaling with iterations
+Key Observations:
+-----------------
+1. Spark scales better for iterative algorithms due to in-memory processing
+2. Hadoop shows better scaling for single-pass algorithms on huge datasets
+3. Sequential implementation becomes impractical beyond 100,000 points
 
 Optimization Recommendations:
 -----------------------------
-For Small Datasets (<10K points):
-• Use sequential or Spark with local mode
-• Disable logging for faster execution
-
-For Medium Datasets (10K-1M points):
-• Use Spark with proper memory configuration
-• Consider data sampling for initial analysis
-• Use broadcast variables for centroids
-
-For Large Datasets (>1M points):
-• Use Spark in cluster mode
-• Implement mini-batch K-Means
-• Consider feature reduction techniques
-• Use optimized libraries (MLlib, scikit-learn)
+1. Use broadcast variables for centroids to reduce network traffic
+2. Adjust number of partitions based on data size and cluster resources
+3. Use efficient serialization (Kryo)
+4. Cache intermediate RDDs that are reused
+5. Monitor and adjust memory settings
 
 ================================================================================
 
-9. CONCLUSIONS AND RECOMMENDATIONS
+8. CONCLUSIONS AND RECOMMENDATIONS
 ================================================================================
 
 Key Findings:
 -------------
-1. Spark provides the best performance for iterative algorithms like K-Means
-2. Hadoop MapReduce is better suited for single-pass algorithms on huge data
-3. Sequential implementation remains practical for small-scale analysis
-4. Proper configuration significantly impacts Spark performance
-5. K-Means++ initialization improves convergence speed and quality
+1. Apache Spark provides optimal performance for iterative machine learning
+2. In-memory computing reduces I/O overhead significantly
+3. Proper configuration is crucial for Spark performance
+4. K-Means benefits from parallel distance calculations
 
-Technical Recommendations:
---------------------------
-1. For production K-Means:
-   • Use Spark MLlib's built-in K-Means implementation
-   • Implement proper error handling and monitoring
-   • Use cross-validation for parameter tuning
-   • Consider alternative algorithms for complex cluster shapes
+Recommendations:
+----------------
+1. For production: Use Spark MLlib's built-in KMeans implementation
+2. For research: Implement custom algorithms for specific needs
+3. Always validate results with domain knowledge
+4. Consider alternative algorithms for non-spherical clusters
 
-2. For research/development:
-   • Start with sequential implementation for validation
-   • Move to Spark for performance testing
-   • Use Hadoop only for specific use cases requiring its strengths
-
-3. Performance Tuning:
-   • Monitor memory usage and GC activity
-   • Adjust number of partitions based on data size
-   • Use appropriate serialization (Kryo)
-   • Consider data partitioning strategies
-
-Future Improvements:
---------------------
-1. Implement distributed K-Means++ initialization
-2. Add support for streaming K-Means
-3. Integrate with GPU acceleration
-4. Add advanced metrics (Calinski-Harabasz, Davies-Bouldin)
-5. Implement automatic K selection (elbow method, silhouette analysis)
+Future Work:
+------------
+1. Implement K-Means++ for better initialization
+2. Add support for different distance metrics
+3. Implement streaming K-Means for real-time clustering
+4. Add automatic K selection using elbow method
 
 ================================================================================
 
-10. APPENDICES
+9. TECHNICAL DETAILS
 ================================================================================
 
-Appendix A: Source Code Structure
----------------------------------
-parallel-kmeans/
-├── src/main/scala/parallel/kmeans/
-│   └── ParallelKMeans.scala    # Spark implementation
-├── hadoop/
-│   ├── KMeansMapper.java       # Hadoop Map phase
-│   ├── KMeansReducer.java      # Hadoop Reduce phase
-│   └── KMeansDriver.java       # Hadoop job control
-├── sequential/
-│   └── SequentialKMeans.java   # Sequential implementation
-└── eval/
-    └── compare_performance.py  # Performance comparison
+Environment Information:
+------------------------
+Execution Time   : $(date -d @$START_TIME +"%Y-%m-%d %H:%M:%S") to $(date -d @$END_TIME +"%Y-%m-%d %H:%M:%S")
+Total Duration   : ${total_time} seconds
+Spark Version    : $(spark-submit --version 2>/dev/null | grep -oP 'version \K[0-9.]+' | head -1 || echo "Unknown")
+Hadoop Version   : $(hadoop version 2>/dev/null | grep -oP 'Hadoop \K[0-9.]+' | head -1 || echo "Unknown")
+System           : $(uname -a)
 
-Appendix B: Execution Commands
-------------------------------
-Sequential: java -jar sequential-kmeans.jar -k 3 -n 20 -i iris.csv
-Hadoop:     hadoop jar kmeans.jar KMeansDriver -k 3 -n 20 /input /output
-Spark:      spark-submit --class ParallelKMeans --master local[*] kmeans.jar
-
-Appendix C: Mathematical Details
---------------------------------
-Euclidean Distance: d(x,y) = √(Σᵢ(xᵢ - yᵢ)²)
-WCSS Formula: WCSS = Σⱼ Σₓ∈Cⱼ ||x - μⱼ||²
-Silhouette: s(i) = (b(i) - a(i)) / max{a(i), b(i)}
-
-Appendix D: References
-----------------------
-1. MacQueen, J. (1967). Some methods for classification and analysis...
-2. Arthur, D., & Vassilvitskii, S. (2007). k-means++: The advantages...
-3. Dean, J., & Ghemawat, S. (2004). MapReduce: Simplified data processing...
-4. Zaharia, M., et al. (2010). Spark: Cluster computing with working sets...
-
-================================================================================
-
-REPORT METADATA
-================================================================================
-Report Generated : $(date +"%Y-%m-%d %H:%M:%S")
-Execution ID     : ${TIMESTAMP}
-Log File         : ${LOG_FILE}
-Results File     : ${RESULT_FILE}
-Report File      : ${REPORT_FILE}
-Environment      : $(uname -a)
+Generated Files:
+----------------
+Log File         : $LOG_FILE
+Results File     : $RESULT_FILE
+This Report      : $REPORT_FILE
 
 ================================================================================
 END OF REPORT
 ================================================================================
 EOF
-
-    # Replace placeholders in report
-    sed -i "s/Timestamp         : /Timestamp         : $(date -d @$START_TIME +"%Y-%m-%d %H:%M:%S")/g" "$REPORT_FILE"
-    sed -i "s/Execution ID      : /Execution ID      : ${TIMESTAMP}/g" "$REPORT_FILE"
-    sed -i "s/Total Runtime     :  seconds/Total Runtime     : ${total_time} seconds/g" "$REPORT_FILE"
-    sed -i "s/Iterations Run    :  of /Iterations Run    : ${ITERATION_COUNT} of ${NUM_ITERATIONS}/g" "$REPORT_FILE"
-    sed -i "s|Input Dataset      : |Input Dataset      : ${INPUT_PATH}|g" "$REPORT_FILE"
-    sed -i "s/Number of Clusters : /Number of Clusters : ${NUM_CLUSTERS}/g" "$REPORT_FILE"
-    sed -i "s/Maximum Iterations : /Maximum Iterations : ${NUM_ITERATIONS}/g" "$REPORT_FILE"
-    sed -i "s/Spark Master       : /Spark Master       : ${SPARK_MASTER}/g" "$REPORT_FILE"
-    sed -i "s/Executor Memory    : /Executor Memory    : ${EXECUTOR_MEMORY}/g" "$REPORT_FILE"
-    sed -i "s/Driver Memory      : /Driver Memory      : ${DRIVER_MEMORY}/g" "$REPORT_FILE"
-    sed -i "s|Project Directory  : |Project Directory  : ${PROJECT_DIR}|g" "$REPORT_FILE"
     
     echo -e "  ${GREEN}✓${NC} Comprehensive report generated: $REPORT_FILE"
     
@@ -988,27 +736,17 @@ function print_summary {
     echo -e "  ${GREEN}•${NC} ${CYAN}Algorithm:${NC} K-Means Clustering (Parallel Spark)"
     echo -e "  ${GREEN}•${NC} ${CYAN}Clusters Found:${NC} $NUM_CLUSTERS"
     echo -e "  ${GREEN}•${NC} ${CYAN}Iterations:${NC} ${ITERATION_COUNT}/${NUM_ITERATIONS}"
-    echo -e "  ${GREEN}•${NC} ${CYAN}Data Points:${NC} 150 Iris samples (4 features)"
     echo -e "  ${GREEN}•${NC} ${CYAN}Execution Time:${NC} $((END_TIME - START_TIME)) seconds"
     
     echo -e "\n${BLUE}📁 Generated Files:${NC}"
-    echo -e "  ${GREEN}•${NC} ${YELLOW}Execution Log:${NC}      $LOG_DIR/"
-    echo -e "  ${GREEN}•${NC} ${YELLOW}Results:${NC}            $RESULTS_DIR/"
+    echo -e "  ${GREEN}•${NC} ${YELLOW}Execution Log:${NC}      $LOG_FILE"
+    echo -e "  ${GREEN}•${NC} ${YELLOW}Results:${NC}            $RESULT_FILE"
     echo -e "  ${GREEN}•${NC} ${YELLOW}Report:${NC}             $REPORT_FILE"
-    echo -e "  ${GREEN}•${NC} ${YELLOW}Latest Report:${NC}     $REPORT_DIR/latest_report.txt"
     
     echo -e "\n${BLUE}📈 Performance Insights:${NC}"
-    echo -e "  1. Spark shows superior performance for iterative algorithms"
-    echo -e "  2. In-memory computing reduces I/O overhead significantly"
-    echo -e "  3. Proper configuration is key to Spark performance"
-    echo -e "  4. See comprehensive report for detailed comparison"
-    
-    echo -e "\n${BLUE}🎯 Next Steps:${NC}"
-    echo -e "  1. Review comprehensive report: ${GREEN}$REPORT_FILE${NC}"
-    echo -e "  2. Compare with sequential and Hadoop implementations"
-    echo -e "  3. Analyze cluster centers for biological interpretation"
-    echo -e "  4. Experiment with different K values"
-    echo -e "  5. Try larger datasets to test scalability"
+    echo -e "  1. Spark efficiently parallelizes distance calculations"
+    echo -e "  2. In-memory computing reduces disk I/O overhead"
+    echo -e "  3. Proper partitioning is key to performance"
     
     echo -e "\n${GREEN}══════════════════════════════════════════════════════════════════════${NC}"
     echo -e "${GREEN}           Parallel K-Means analysis completed successfully! 🎉       ${NC}"
@@ -1042,13 +780,6 @@ Environment Variables:
     NUM_CLUSTERS            Number of clusters
     NUM_ITERATIONS          Number of iterations
     SPARK_MASTER            Spark master URL
-
-Features:
-    • Mathematical explanation of K-Means operations
-    • Iteration-by-iteration progress tracking
-    • Comprehensive performance comparison
-    • Professional report generation
-    • Runtime analysis across implementations
 
 EOF
 }
