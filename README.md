@@ -697,7 +697,7 @@ EOF
     calculate_accuracy
 }
 
-# Generate report (keeping original comprehensive report generation)
+# Generate report
 function generate_report {
     animated_header "GENERATING REPORT"
     
@@ -708,8 +708,25 @@ function generate_report {
     done
     echo
     
-    # Keep the original comprehensive report generation code here
-    # (Same as in original script)
+    # Generate basic report
+    cat > "$REPORT_FILE" << EOF
+# K-Means Clustering Report
+
+## Execution Details
+- **Timestamp**: $TIMESTAMP
+- **Input Path**: $INPUT_PATH
+- **Clusters**: $NUM_CLUSTERS
+- **Iterations**: $NUM_ITERATIONS
+- **Spark Master**: $SPARK_MASTER
+
+## Results
+- **Result File**: $RESULT_FILE
+- **Accuracy File**: $ACCURACY_FILE
+- **Log File**: $LOG_FILE
+
+## Status
+✓ Successfully completed
+EOF
     
     success "Report generated: $REPORT_FILE ✓"
     
@@ -728,6 +745,9 @@ function print_summary {
     printf "${GREEN}║${NC} ${BOLD}%-20s${NC} : ${CYAN}%-30s${NC} ${GREEN}║${NC}\n" "Clusters" "$NUM_CLUSTERS"
     printf "${GREEN}║${NC} ${BOLD}%-20s${NC} : ${CYAN}%-30s${NC} ${GREEN}║${NC}\n" "Iterations" "$NUM_ITERATIONS"
     echo -e "${GREEN}╠════════════════════════════════════════════════════════╣${NC}"
+    printf "${GREEN}║${NC} ${BOLD}%-20s${NC} : ${YELLOW}%-30s${NC} ${GREEN}║${NC}\n" "Results" "$(basename $RESULT_FILE)"
+    printf "${GREEN}║${NC} ${BOLD}%-20s${NC} : ${YELLOW}%-30s${NC} ${GREEN}║${NC}\n" "Log" "$(basename $LOG_FILE)"
+    printf "${GREEN}║${NC} ${BOLD}%-20s${NC} : ${YELLOW}%-30s${NC} ${GREEN}║${NC}\n" "Accuracy" "$(basename $ACCURACY_FILE)"
     printf "${GREEN}║${NC} ${BOLD}%-20s${NC} : ${YELLOW}%-30s${NC} ${GREEN}║${NC}\n" "Report" "$(basename $REPORT_FILE)"
     echo -e "${GREEN}╚════════════════════════════════════════════════════════╝${NC}\n"
     
@@ -800,7 +820,4 @@ function main {
     fi
 }
 
-main "$@"n" "Results" "$(basename $RESULT_FILE)"
-    printf "${GREEN}║${NC} ${BOLD}%-20s${NC} : ${YELLOW}%-30s${NC} ${GREEN}║${NC}\n" "Log" "$(basename $LOG_FILE)"
-    printf "${GREEN}║${NC} ${BOLD}%-20s${NC} : ${YELLOW}%-30s${NC} ${GREEN}║${NC}\n" "Accuracy" "$(basename $ACCURACY_FILE)"
-    printf "${GREEN}║${NC} ${BOLD}%-20s${NC} : ${YELLOW}%-30s${NC} ${GREEN}║${NC}\
+main "$@"
