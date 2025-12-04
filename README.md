@@ -5,6 +5,11 @@
 
 set -euo pipefail  # Exit on error, undefined vars, and pipe failures
 
+# Global variables
+ITERATION_COUNT=0
+START_TIME=0
+END_TIME=0
+
 # Configurable parameters
 PROJECT_DIR="${PROJECT_DIR:-/home/cloudera/parallel-kmeans}"
 JAR_NAME="${JAR_NAME:-parallel-kmeans-1.0-SNAPSHOT.jar}"
@@ -57,6 +62,26 @@ function show_progress {
     printf "%.0s#" $(seq 1 $completed)
     printf "%.0s-" $(seq 1 $remaining)
     printf "] ${percent}%% (${current}/${total})${NC}"
+}
+
+# Display iteration details
+function display_iteration {
+    local iteration=$1
+    local wcss=$2
+    local movement=$3
+    
+    echo -e "\n${BLUE}Iteration ${iteration}/${NUM_ITERATIONS}:${NC}"
+    echo -e "  ${YELLOW}•${NC} WCSS (Within-Cluster Sum of Squares): ${GREEN}$wcss${NC}"
+    echo -e "  ${YELLOW}•${NC} Centroid Movement: ${GREEN}$movement${NC}"
+    
+    # Show convergence status
+    if (( $(echo "$movement < 0.001" | bc -l 2>/dev/null || echo "0") )); then
+        echo -e "  ${YELLOW}•${NC} Convergence Status: ${GREEN}High Convergence${NC}"
+    elif (( $(echo "$movement < 0.01" | bc -l 2>/dev/null || echo "0") )); then
+        echo -e "  ${YELLOW}•${NC} Convergence Status: ${CYAN}Good Progress${NC}"
+    else
+        echo -e "  ${YELLOW}•${NC} Convergence Status: ${YELLOW}Still Adjusting${NC}"
+    fi
 }
 
 # Trap errors and cleanup
@@ -194,8 +219,12 @@ function run_spark_job {
     
     echo -e "\n${YELLOW}Initializing Spark session...${NC}"
     
-    local start_time=$(date +%s)
-    local iteration_count=0
+    START_TIME=$(date +%s)
+    ITERATION_COUNT=0
+    
+    # Create a named pipe for iteration tracking
+    local iteration_pipe=$(mktemp -u)
+    mkfifo "$iteration_pipe"
     
     # Run Spark job and process output
     spark-submit \
@@ -213,10 +242,21 @@ function run_spark_job {
         echo "$line" >> "$LOG_FILE"
         echo "$line" >> "$RESULT_FILE"
         
-        # Hide technical logs, show only important information
+        # Capture iteration details
         if [[ "$line" == *"Iteration"* && "$line" == *"completed"* ]]; then
-            iteration_count=$((iteration_count + 1))
-            show_progress $iteration_count $NUM_ITERATIONS
+            ITERATION_COUNT=$((ITERATION_COUNT + 1))
+            echo "$ITERATION_COUNT" > "$iteration_pipe"
+            
+            # Extract WCSS and movement
+            local wcss=$(echo "$line" | grep -oP "WCSS: \K[\d.]+" || echo "N/A")
+            local movement=$(echo "$line" | grep -oP "movement: \K[\d.]+" || echo "N/A")
+            
+            # Display iteration details
+            display_iteration "$ITERATION_COUNT" "$wcss" "$movement"
+            
+            # Show progress
+            show_progress "$ITERATION_COUNT" "$NUM_ITERATIONS"
+            
         elif [[ "$line" == *"Cluster centers:"* ]]; then
             echo -e "\n\n${GREEN}══════════════════════════════════════════════════════════════════════${NC}"
             echo -e "${GREEN}                     CLUSTER CENTERS FOUND                            ${NC}"
@@ -232,9 +272,12 @@ function run_spark_job {
         fi
     done
     
+    # Clean up pipe
+    rm -f "$iteration_pipe"
+    
     local exit_code=${PIPESTATUS[0]}
-    local end_time=$(date +%s)
-    local duration=$((end_time - start_time))
+    END_TIME=$(date +%s)
+    local duration=$((END_TIME - START_TIME))
     
     echo ""
     
@@ -298,6 +341,7 @@ function display_results {
     local data_points=$(hdfs dfs -cat "$INPUT_PATH" 2>/dev/null | wc -l 2>/dev/null || echo "N/A")
     echo -e "  ${YELLOW}•${NC} Data Points Processed: $data_points"
     echo -e "  ${YELLOW}•${NC} Features: 4 (sepal length, sepal width, petal length, petal width)"
+    echo -e "  ${YELLOW}•${NC} Iterations Completed: $ITERATION_COUNT/$NUM_ITERATIONS"
 }
 
 # Generate professional report
@@ -306,7 +350,13 @@ function generate_report {
     echo -e "${CYAN}                   GENERATING EXECUTION REPORT                        ${NC}"
     echo -e "${CYAN}══════════════════════════════════════════════════════════════════════${NC}\n"
     
-    local total_time=$(grep -oP "Total runtime: \K[\d.]+" "$RESULT_FILE" 2>/dev/null || echo "N/A")
+    local total_time=$((END_TIME - START_TIME))
+    local total_time_str="${total_time} seconds"
+    
+    # Extract metrics from log file
+    local final_wcss=$(grep -oP "WCSS: \K[\d.]+" "$LOG_FILE" | tail -1 || echo "N/A")
+    local final_silhouette=$(grep -oP "Silhouette: \K[\d.]+" "$LOG_FILE" | tail -1 || echo "N/A")
+    local total_runtime=$(grep -oP "Total runtime: \K[\d.]+ seconds" "$RESULT_FILE" 2>/dev/null || echo "N/A")
     
     # Create professional report
     cat > "$REPORT_FILE" << EOF
@@ -317,19 +367,21 @@ function generate_report {
 
 EXECUTION SUMMARY
 ─────────────────────────────────────────────────────────────────────────────────
-Execution Timestamp : $(date +"%Y-%m-%d %H:%M:%S")
+Execution Timestamp : $(date -d @$START_TIME +"%Y-%m-%d %H:%M:%S")
 Run ID             : $TIMESTAMP
 Status             : COMPLETED SUCCESSFULLY
-Total Runtime      : ${total_time} seconds
+Total Runtime      : ${total_time_str}
+Iterations Completed: ${ITERATION_COUNT} of ${NUM_ITERATIONS}
 
 CONFIGURATION PARAMETERS
 ─────────────────────────────────────────────────────────────────────────────────
 Input Dataset      : $INPUT_PATH
 Number of Clusters : $NUM_CLUSTERS
-Iterations         : $NUM_ITERATIONS
+Maximum Iterations : $NUM_ITERATIONS
 Spark Master       : $SPARK_MASTER
 Executor Memory    : $EXECUTOR_MEMORY
 Driver Memory      : $DRIVER_MEMORY
+Project Directory  : $PROJECT_DIR
 
 CLUSTER ANALYSIS RESULTS
 ─────────────────────────────────────────────────────────────────────────────────
@@ -338,12 +390,12 @@ EOF
     # Add cluster centers to report
     if grep -q "Cluster centers:" "$RESULT_FILE"; then
         echo "" >> "$REPORT_FILE"
+        echo "FINAL CLUSTER CENTERS:" >> "$REPORT_FILE"
+        echo "─────────────────────" >> "$REPORT_FILE"
         grep -A $((NUM_CLUSTERS + 2)) "Cluster centers:" "$RESULT_FILE" | \
+        grep -v "Cluster centers:" | \
         while read -r line; do
-            if [[ "$line" == *"Cluster centers:"* ]]; then
-                echo "FINAL CLUSTER CENTERS:" >> "$REPORT_FILE"
-                echo "---------------------" >> "$REPORT_FILE"
-            elif [[ -n "$line" ]]; then
+            if [[ -n "$line" ]]; then
                 echo "  $line" >> "$REPORT_FILE"
             fi
         done
@@ -354,52 +406,76 @@ EOF
 
 QUALITY METRICS
 ─────────────────────────────────────────────────────────────────────────────────
+Within-Cluster Sum of Squares (WCSS) : ${final_wcss}
+Silhouette Score                     : ${final_silhouette}
+
+Interpretation:
+• WCSS measures compactness (lower is better)
+• Silhouette Score ranges from -1 to 1 (higher is better)
+• Score > 0.5 indicates reasonable clustering
+• Score > 0.7 indicates strong clustering
+
 EOF
-    
-    if grep -q "WCSS" "$RESULT_FILE"; then
-        grep "WCSS" "$RESULT_FILE" >> "$REPORT_FILE"
-    fi
-    
-    if grep -q "Silhouette" "$RESULT_FILE"; then
-        grep "Silhouette" "$RESULT_FILE" >> "$REPORT_FILE"
-    fi
     
     # Add iteration history if available
     if grep -q "Iteration.*WCSS" "$LOG_FILE"; then
         cat >> "$REPORT_FILE" << EOF
-
 ITERATION HISTORY
 ─────────────────────────────────────────────────────────────────────────────────
-Iteration    WCSS            Centroid Movement      Convergence
-─────────    ───────         ─────────────────      ───────────
+Iteration    WCSS            Centroid Movement      Status
+─────────    ───────         ─────────────────      ───────
 EOF
         
-        grep "Iteration.*WCSS" "$LOG_FILE" | head -10 | \
-        while read -r line; do
-            iteration=$(echo "$line" | grep -oP "Iteration \K\d+")
-            wcss=$(echo "$line" | grep -oP "WCSS: \K[\d.]+")
-            movement=$(echo "$line" | grep -oP "movement: \K[\d.]+" || echo "N/A")
-            echo "  $iteration        $wcss          $movement              " >> "$REPORT_FILE"
-        done
+        local iteration_num=0
+        while IFS= read -r line; do
+            iteration_num=$((iteration_num + 1))
+            local wcss=$(echo "$line" | grep -oP "WCSS: \K[\d.]+" || echo "N/A")
+            local movement=$(echo "$line" | grep -oP "movement: \K[\d.]+" || echo "N/A")
+            
+            # Determine status
+            local status="Processing"
+            if [ "$movement" != "N/A" ]; then
+                if (( $(echo "$movement < 0.001" | bc -l 2>/dev/null || echo "0") )); then
+                    status="Converged"
+                elif (( $(echo "$movement < 0.01" | bc -l 2>/dev/null || echo "0") )); then
+                    status="Good Progress"
+                else
+                    status="Adjusting"
+                fi
+            fi
+            
+            printf "  %-9s    %-14s   %-20s   %-12s\n" "$iteration_num" "$wcss" "$movement" "$status" >> "$REPORT_FILE"
+        done < <(grep "Iteration.*WCSS" "$LOG_FILE")
+        
+        echo "" >> "$REPORT_FILE"
     fi
+    
+    # Add convergence analysis
+    cat >> "$REPORT_FILE" << EOF
+CONVERGENCE ANALYSIS
+─────────────────────────────────────────────────────────────────────────────────
+Total Iterations Run   : ${ITERATION_COUNT}
+Maximum Allowed        : ${NUM_ITERATIONS}
+Convergence Status     : $(if [ $ITERATION_COUNT -lt $NUM_ITERATIONS ]; then echo "Early Convergence"; else echo "Max Iterations Reached"; fi)
+
+EOF
     
     # Add execution details
     cat >> "$REPORT_FILE" << EOF
-
 EXECUTION DETAILS
 ─────────────────────────────────────────────────────────────────────────────────
-Start Time        : $(date -d @$start_time +"%Y-%m-%d %H:%M:%S")
-End Time          : $(date +"%Y-%m-%d %H:%M:%S")
+Start Time        : $(date -d @$START_TIME +"%Y-%m-%d %H:%M:%S")
+End Time          : $(date -d @$END_TIME +"%Y-%m-%d %H:%M:%S")
 Duration          : ${total_time} seconds
 Input Size        : $(hdfs dfs -du -h "$INPUT_PATH" 2>/dev/null | awk '{print $1}' || echo "N/A")
 Data Points       : $(hdfs dfs -cat "$INPUT_PATH" 2>/dev/null | wc -l 2>/dev/null || echo "N/A")
+Features          : 4 (sepal length, sepal width, petal length, petal width)
 
 PERFORMANCE INSIGHTS
 ─────────────────────────────────────────────────────────────────────────────────
-1. Convergence was achieved in $iteration_count iterations
-2. Cluster separation quality is indicated by Silhouette Score
-3. Within-cluster variance is measured by WCSS
-4. Execution efficiency is optimal for dataset size
+1. Algorithm $(if [ $ITERATION_COUNT -lt $NUM_ITERATIONS ]; then echo "converged early in ${ITERATION_COUNT} iterations"; else echo "completed all ${NUM_ITERATIONS} iterations"; fi)
+2. Final WCSS of ${final_wcss} indicates $(if [ "$final_wcss" != "N/A" ]; then if (( $(echo "$final_wcss < 50" | bc -l 2>/dev/null || echo "0") )); then echo "good cluster compactness"; else echo "moderate cluster compactness"; fi; else echo "N/A"; fi)
+3. Silhouette score of ${final_silhouette} suggests $(if [ "$final_silhouette" != "N/A" ]; then if (( $(echo "$final_silhouette > 0.7" | bc -l 2>/dev/null || echo "0") )); then echo "well-separated clusters"; elif (( $(echo "$final_silhouette > 0.5" | bc -l 2>/dev/null || echo "0") )); then echo "reasonable cluster separation"; else echo "some cluster overlap"; fi; else echo "N/A"; fi)
 
 RECOMMENDATIONS
 ─────────────────────────────────────────────────────────────────────────────────
@@ -407,15 +483,17 @@ EOF
     
     if [ "$NUM_CLUSTERS" -eq 3 ]; then
         cat >> "$REPORT_FILE" << EOF
-• For Iris dataset, K=3 is optimal (matches biological species)
-• Consider running with K=2 to K=5 for elbow method analysis
-• Use silhouette analysis for cluster quality validation
+• K=3 is optimal for Iris dataset (matches biological species)
+• Consider running elbow method with K=2 to K=5 to validate choice
+• For quality validation, use cross-validation with different random seeds
+• Consider feature scaling if features have different units or ranges
 EOF
     else
         cat >> "$REPORT_FILE" << EOF
-• Consider running elbow method to validate K=$NUM_CLUSTERS
-• Use silhouette analysis for cluster quality validation
+• Consider validating K=$NUM_CLUSTERS using elbow method
+• Run silhouette analysis for different K values (2-10)
 • For comparison, run with K=3 (standard for Iris dataset)
+• Use domain knowledge to interpret cluster assignments
 EOF
     fi
     
@@ -423,10 +501,10 @@ EOF
 
 TECHNICAL DETAILS
 ─────────────────────────────────────────────────────────────────────────────────
-Spark Version     : $(spark-submit --version 2>/dev/null | grep version | head -1)
-Hadoop Version    : $(hadoop version 2>/dev/null | grep Hadoop | head -1)
+Spark Version     : $(spark-submit --version 2>/dev/null | grep "version" | head -1 | cut -d' ' -f2- || echo "N/A")
+Hadoop Version    : $(hadoop version 2>/dev/null | grep "Hadoop" | head -1 | cut -d' ' -f2 || echo "N/A")
 JAR File          : $JAR_NAME
-Project Directory : $PROJECT_DIR
+Build Timestamp   : $(date -r "target/$JAR_NAME" +"%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "N/A")
 
 FILES GENERATED
 ─────────────────────────────────────────────────────────────────────────────────
@@ -455,8 +533,9 @@ function print_summary {
     
     echo -e "${BLUE}📊 Results Summary:${NC}"
     echo -e "  ${GREEN}•${NC} ${CYAN}Cluster Analysis:${NC} Successfully identified $NUM_CLUSTERS clusters"
-    echo -e "  ${GREEN}•${NC} ${CYAN}Convergence:${NC} Algorithm converged in ${iteration_count:-N/A} iterations"
+    echo -e "  ${GREEN}•${NC} ${CYAN}Convergence:${NC} Algorithm completed $ITERATION_COUNT iterations"
     echo -e "  ${GREEN}•${NC} ${CYAN}Data Processed:${NC} Iris dataset (150 samples, 4 features)"
+    echo -e "  ${GREEN}•${NC} ${CYAN}Execution Time:${NC} $((END_TIME - START_TIME)) seconds"
     
     echo -e "\n${BLUE}📁 Generated Files:${NC}"
     echo -e "  ${GREEN}•${NC} ${YELLOW}Execution Log:${NC}      $LOG_DIR/"
@@ -468,6 +547,7 @@ function print_summary {
     echo -e "  2. Analyze cluster centers for biological interpretation"
     echo -e "  3. Consider running with different K values for comparison"
     echo -e "  4. Validate results with domain knowledge"
+    echo -e "  5. Check $REPORT_DIR/latest_report.txt for quick access"
     
     echo -e "\n${GREEN}══════════════════════════════════════════════════════════════════════${NC}"
     echo -e "${GREEN}           K-Means clustering completed successfully! 🎉              ${NC}"
@@ -549,9 +629,6 @@ function parse_args {
 # Main execution flow
 function main {
     print_banner
-    
-    # Store start time
-    start_time=$(date +%s)
     
     parse_args "$@"
     
