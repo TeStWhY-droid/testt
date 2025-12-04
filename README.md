@@ -27,6 +27,7 @@ LOG_FILE="$LOG_DIR/kmeans_run_$TIMESTAMP.log"
 RESULT_FILE="$RESULTS_DIR/kmeans_result_$TIMESTAMP.txt"
 METRICS_FILE="$RESULTS_DIR/kmeans_metrics_$TIMESTAMP.json"
 REPORT_FILE="$REPORT_DIR/kmeans_comprehensive_report_$TIMESTAMP.md"
+ACCURACY_FILE="$RESULTS_DIR/kmeans_accuracy_$TIMESTAMP.txt"
 
 # Colors for better visibility
 RED='\033[0;31m'
@@ -122,17 +123,37 @@ function build_project {
     info "Changing to project directory: $PROJECT_DIR"
     cd "$PROJECT_DIR" || { error "Project directory not found"; exit 1; }
     
-    info "Cleaning previous build artifacts..."
-    mvn clean >> "$LOG_FILE" 2>&1
+    echo -e "\n${CYAN}╔════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║              Maven Build Process                       ║${NC}"
+    echo -e "${CYAN}╚════════════════════════════════════════════════════════╝${NC}\n"
     
-    info "Compiling and packaging project..."
-    if mvn package -DskipTests >> "$LOG_FILE" 2>&1; then
-        success "Maven build completed successfully"
-    else
-        error "Maven build failed. Check log: $LOG_FILE"
-        tail -n 50 "$LOG_FILE"
-        exit 1
+    info "Step 1/3: Cleaning previous build artifacts..."
+    echo -e "${YELLOW}Running: mvn clean${NC}"
+    if mvn clean 2>&1 | tee -a "$LOG_FILE" | grep -E "BUILD SUCCESS|BUILD FAILURE|ERROR"; then
+        success "Clean completed"
     fi
+    
+    info "Step 2/3: Compiling Scala sources..."
+    echo -e "${YELLOW}Running: mvn compile${NC}"
+    if mvn compile 2>&1 | tee -a "$LOG_FILE" | grep -E "BUILD SUCCESS|BUILD FAILURE|Compiling|compiled"; then
+        success "Compilation completed"
+    fi
+    
+    info "Step 3/3: Packaging JAR file..."
+    echo -e "${YELLOW}Running: mvn package -DskipTests${NC}"
+    
+    local build_output=$(mktemp)
+    if mvn package -DskipTests 2>&1 | tee "$build_output" | tee -a "$LOG_FILE" | grep -E "BUILD SUCCESS|BUILD FAILURE|Building jar|Building|jar:jar"; then
+        if grep -q "BUILD SUCCESS" "$build_output"; then
+            success "Maven build completed successfully"
+        else
+            error "Maven build failed"
+            tail -n 50 "$LOG_FILE"
+            rm -f "$build_output"
+            exit 1
+        fi
+    fi
+    rm -f "$build_output"
     
     # Verify JAR exists
     if [ ! -f "target/$JAR_NAME" ]; then
@@ -141,7 +162,18 @@ function build_project {
     fi
     
     local jar_size=$(du -h "target/$JAR_NAME" | cut -f1)
-    success "JAR created: target/$JAR_NAME (${jar_size})"
+    local jar_files=$(ls -1 target/*.jar 2>/dev/null | wc -l)
+    
+    echo -e "\n${GREEN}╔════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║              Build Summary                             ║${NC}"
+    echo -e "${GREEN}╠════════════════════════════════════════════════════════╣${NC}"
+    printf "${GREEN}║${NC} %-25s : %-25s ${GREEN}║${NC}\n" "JAR File" "$JAR_NAME"
+    printf "${GREEN}║${NC} %-25s : %-25s ${GREEN}║${NC}\n" "Size" "$jar_size"
+    printf "${GREEN}║${NC} %-25s : %-25s ${GREEN}║${NC}\n" "Location" "target/"
+    printf "${GREEN}║${NC} %-25s : %-25s ${GREEN}║${NC}\n" "Total JAR files" "$jar_files"
+    echo -e "${GREEN}╚════════════════════════════════════════════════════════╝${NC}\n"
+    
+    success "JAR ready for Spark submission: target/$JAR_NAME"
 }
 
 # Run Spark job
@@ -181,6 +213,346 @@ function run_spark_job {
     fi
 }
 
+# Calculate clustering accuracy and metrics
+function calculate_accuracy {
+    info "Calculating clustering accuracy and quality metrics..."
+    
+    # Check if we have the Iris dataset with labels
+    local has_labels=false
+    if echo "$INPUT_PATH" | grep -qi "iris"; then
+        has_labels=true
+        info "Detected Iris dataset - will calculate accuracy against true labels"
+    fi
+    
+    # Create Python script for accuracy calculation
+    cat > /tmp/calc_accuracy.py << 'PYTHON_SCRIPT'
+#!/usr/bin/env python
+import sys
+import math
+from collections import defaultdict, Counter
+
+def euclidean_distance(p1, p2):
+    """Calculate Euclidean distance between two points"""
+    return math.sqrt(sum((a - b) ** 2 for a, b in zip(p1, p2)))
+
+def load_data(filepath):
+    """Load dataset from HDFS or local file"""
+    import subprocess
+    data = []
+    labels = []
+    
+    try:
+        # Try to read from HDFS
+        if filepath.startswith('hdfs://'):
+            cmd = ['hdfs', 'dfs', '-cat', filepath]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            lines = result.stdout.strip().split('\n')
+        else:
+            # Read from local file
+            with open(filepath, 'r') as f:
+                lines = f.readlines()
+        
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            
+            parts = line.split(',')
+            if len(parts) >= 4:
+                # Extract features (first 4 columns for Iris)
+                features = [float(x) for x in parts[:4]]
+                data.append(features)
+                
+                # Extract label if exists (last column)
+                if len(parts) > 4:
+                    labels.append(parts[-1].strip())
+        
+        return data, labels
+    except Exception as e:
+        print(f"Error loading data: {e}", file=sys.stderr)
+        return [], []
+
+def load_centroids(result_file):
+    """Extract cluster centers from Spark output"""
+    centroids = []
+    in_centers = False
+    
+    try:
+        with open(result_file, 'r') as f:
+            for line in f:
+                if 'Cluster centers:' in line or 'Final cluster centers:' in line:
+                    in_centers = True
+                    continue
+                
+                if in_centers:
+                    # Try to parse centroid coordinates
+                    line = line.strip()
+                    if not line or line.startswith('===') or line.startswith('---'):
+                        break
+                    
+                    # Extract numbers from various formats
+                    # Format: "Cluster 0: [5.0, 3.4, 1.5, 0.2]"
+                    # Format: "[5.0,3.4,1.5,0.2]"
+                    if '[' in line and ']' in line:
+                        coords_str = line[line.index('['):line.index(']')+1]
+                        coords_str = coords_str.replace('[', '').replace(']', '')
+                        coords = [float(x.strip()) for x in coords_str.split(',')]
+                        if len(coords) >= 4:
+                            centroids.append(coords[:4])
+        
+        return centroids
+    except Exception as e:
+        print(f"Error loading centroids: {e}", file=sys.stderr)
+        return []
+
+def assign_to_clusters(data, centroids):
+    """Assign each data point to nearest centroid"""
+    assignments = []
+    for point in data:
+        distances = [euclidean_distance(point, c) for c in centroids]
+        cluster_id = distances.index(min(distances))
+        assignments.append(cluster_id)
+    return assignments
+
+def calculate_purity(assignments, true_labels):
+    """Calculate purity score"""
+    if not true_labels:
+        return 0.0
+    
+    clusters = defaultdict(list)
+    for i, cluster_id in enumerate(assignments):
+        clusters[cluster_id].append(true_labels[i])
+    
+    correct = 0
+    for cluster_id, labels in clusters.items():
+        # Find most common label in this cluster
+        most_common = Counter(labels).most_common(1)[0][1]
+        correct += most_common
+    
+    return correct / len(assignments) if assignments else 0.0
+
+def calculate_accuracy(assignments, true_labels):
+    """Calculate accuracy using best label mapping"""
+    if not true_labels:
+        return 0.0
+    
+    clusters = defaultdict(list)
+    for i, cluster_id in enumerate(assignments):
+        clusters[cluster_id].append(true_labels[i])
+    
+    # Find best mapping of clusters to labels
+    cluster_to_label = {}
+    for cluster_id, labels in clusters.items():
+        most_common_label = Counter(labels).most_common(1)[0][0]
+        cluster_to_label[cluster_id] = most_common_label
+    
+    # Calculate accuracy
+    correct = sum(1 for i, cluster_id in enumerate(assignments) 
+                  if cluster_to_label.get(cluster_id) == true_labels[i])
+    
+    return correct / len(assignments) if assignments else 0.0
+
+def calculate_wcss(data, centroids, assignments):
+    """Calculate Within-Cluster Sum of Squares"""
+    wcss = 0.0
+    for i, point in enumerate(data):
+        cluster_id = assignments[i]
+        centroid = centroids[cluster_id]
+        wcss += euclidean_distance(point, centroid) ** 2
+    return wcss
+
+def calculate_silhouette_sample(data, assignments, i):
+    """Calculate silhouette score for a single sample"""
+    point = data[i]
+    cluster_id = assignments[i]
+    
+    # Calculate a(i): mean distance to points in same cluster
+    same_cluster = [j for j, c in enumerate(assignments) if c == cluster_id and j != i]
+    if not same_cluster:
+        return 0.0
+    
+    a_i = sum(euclidean_distance(point, data[j]) for j in same_cluster) / len(same_cluster)
+    
+    # Calculate b(i): mean distance to points in nearest cluster
+    other_clusters = set(assignments) - {cluster_id}
+    if not other_clusters:
+        return 0.0
+    
+    b_i = float('inf')
+    for other_cluster in other_clusters:
+        other_points = [j for j, c in enumerate(assignments) if c == other_cluster]
+        if other_points:
+            mean_dist = sum(euclidean_distance(point, data[j]) for j in other_points) / len(other_points)
+            b_i = min(b_i, mean_dist)
+    
+    # Silhouette score
+    return (b_i - a_i) / max(a_i, b_i) if max(a_i, b_i) > 0 else 0.0
+
+def calculate_silhouette(data, assignments):
+    """Calculate average silhouette score"""
+    if len(set(assignments)) <= 1:
+        return 0.0
+    
+    scores = [calculate_silhouette_sample(data, assignments, i) for i in range(len(data))]
+    return sum(scores) / len(scores) if scores else 0.0
+
+def main():
+    if len(sys.argv) < 3:
+        print("Usage: calc_accuracy.py <input_data> <result_file> <output_file>")
+        sys.exit(1)
+    
+    input_file = sys.argv[1]
+    result_file = sys.argv[2]
+    output_file = sys.argv[3] if len(sys.argv) > 3 else '/tmp/accuracy_output.txt'
+    
+    print("Loading data...")
+    data, true_labels = load_data(input_file)
+    
+    if not data:
+        print("Error: No data loaded")
+        sys.exit(1)
+    
+    print(f"Loaded {len(data)} data points")
+    
+    print("Loading cluster centers...")
+    centroids = load_centroids(result_file)
+    
+    if not centroids:
+        print("Error: No centroids found in result file")
+        sys.exit(1)
+    
+    print(f"Loaded {len(centroids)} cluster centers")
+    
+    print("Assigning points to clusters...")
+    assignments = assign_to_clusters(data, centroids)
+    
+    print("Calculating metrics...")
+    
+    # Calculate metrics
+    wcss = calculate_wcss(data, centroids, assignments)
+    
+    # Calculate silhouette score (may take time for large datasets)
+    print("Calculating silhouette score (this may take a moment)...")
+    silhouette = calculate_silhouette(data, assignments) if len(data) < 1000 else 0.0
+    
+    # Calculate accuracy if labels available
+    accuracy = 0.0
+    purity = 0.0
+    if true_labels:
+        print("Calculating accuracy and purity...")
+        accuracy = calculate_accuracy(assignments, true_labels)
+        purity = calculate_purity(assignments, true_labels)
+    
+    # Cluster distribution
+    cluster_dist = Counter(assignments)
+    
+    # Write results
+    with open(output_file, 'w') as f:
+        f.write("=" * 60 + "\n")
+        f.write("K-MEANS CLUSTERING ACCURACY REPORT\n")
+        f.write("=" * 60 + "\n\n")
+        
+        f.write(f"Dataset: {input_file}\n")
+        f.write(f"Number of samples: {len(data)}\n")
+        f.write(f"Number of clusters: {len(centroids)}\n")
+        f.write(f"Number of features: {len(data[0]) if data else 0}\n\n")
+        
+        f.write("-" * 60 + "\n")
+        f.write("QUALITY METRICS\n")
+        f.write("-" * 60 + "\n")
+        f.write(f"Within-Cluster Sum of Squares (WCSS): {wcss:.4f}\n")
+        f.write(f"Silhouette Score: {silhouette:.4f}\n")
+        
+        if true_labels:
+            f.write(f"Accuracy (with best label mapping): {accuracy:.4f} ({accuracy*100:.2f}%)\n")
+            f.write(f"Purity Score: {purity:.4f} ({purity*100:.2f}%)\n")
+        else:
+            f.write("Accuracy: N/A (no true labels available)\n")
+        
+        f.write("\n" + "-" * 60 + "\n")
+        f.write("CLUSTER DISTRIBUTION\n")
+        f.write("-" * 60 + "\n")
+        for cluster_id in sorted(cluster_dist.keys()):
+            count = cluster_dist[cluster_id]
+            percentage = (count / len(data)) * 100
+            f.write(f"Cluster {cluster_id}: {count} points ({percentage:.1f}%)\n")
+        
+        f.write("\n" + "-" * 60 + "\n")
+        f.write("INTERPRETATION\n")
+        f.write("-" * 60 + "\n")
+        
+        # WCSS interpretation
+        f.write(f"\nWCSS ({wcss:.4f}):\n")
+        f.write("  - Lower values indicate tighter, more compact clusters\n")
+        f.write("  - Use elbow method to find optimal K\n")
+        
+        # Silhouette interpretation
+        f.write(f"\nSilhouette Score ({silhouette:.4f}):\n")
+        if silhouette > 0.7:
+            f.write("  - Excellent: Strong cluster structure\n")
+        elif silhouette > 0.5:
+            f.write("  - Good: Reasonable cluster structure\n")
+        elif silhouette > 0.25:
+            f.write("  - Fair: Weak cluster structure\n")
+        else:
+            f.write("  - Poor: No substantial cluster structure\n")
+        
+        if true_labels:
+            f.write(f"\nAccuracy ({accuracy*100:.2f}%):\n")
+            if accuracy > 0.9:
+                f.write("  - Excellent: Clusters align very well with true labels\n")
+            elif accuracy > 0.7:
+                f.write("  - Good: Clusters mostly align with true labels\n")
+            elif accuracy > 0.5:
+                f.write("  - Fair: Some alignment with true labels\n")
+            else:
+                f.write("  - Poor: Clusters don't align well with true labels\n")
+        
+        f.write("\n" + "=" * 60 + "\n")
+    
+    print(f"\nResults written to: {output_file}")
+    
+    # Print summary to stdout
+    print("\n" + "=" * 60)
+    print("SUMMARY")
+    print("=" * 60)
+    print(f"WCSS: {wcss:.4f}")
+    print(f"Silhouette Score: {silhouette:.4f}")
+    if true_labels:
+        print(f"Accuracy: {accuracy*100:.2f}%")
+        print(f"Purity: {purity*100:.2f}%")
+    print("=" * 60)
+
+if __name__ == "__main__":
+    main()
+PYTHON_SCRIPT
+    
+    chmod +x /tmp/calc_accuracy.py
+    
+    # Run accuracy calculation
+    info "Running accuracy calculation script..."
+    if python /tmp/calc_accuracy.py "$INPUT_PATH" "$RESULT_FILE" "$ACCURACY_FILE" 2>&1 | tee -a "$LOG_FILE"; then
+        success "Accuracy calculation completed"
+        
+        # Display results
+        if [ -f "$ACCURACY_FILE" ]; then
+            echo -e "\n${CYAN}╔════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${CYAN}║           Clustering Quality Metrics                   ║${NC}"
+            echo -e "${CYAN}╚════════════════════════════════════════════════════════╝${NC}\n"
+            
+            # Extract and display key metrics
+            if grep -q "WCSS" "$ACCURACY_FILE"; then
+                grep -A 10 "QUALITY METRICS" "$ACCURACY_FILE" | grep -v "^-" | grep -v "QUALITY METRICS"
+            fi
+            
+            echo ""
+        fi
+    else
+        warn "Accuracy calculation failed or incomplete"
+        return 1
+    fi
+}
+
 # Extract and format results
 function process_results {
     info "Processing results..."
@@ -201,7 +573,8 @@ function process_results {
     "num_clusters": $NUM_CLUSTERS,
     "num_iterations": $NUM_ITERATIONS,
     "spark_master": "$SPARK_MASTER",
-    "status": "success"
+    "status": "success",
+    "accuracy_file": "$ACCURACY_FILE"
 }
 EOF
     
@@ -212,6 +585,9 @@ EOF
     echo -e "${CYAN}║        Cluster Centers Found           ║${NC}"
     echo -e "${CYAN}╚════════════════════════════════════════╝${NC}\n"
     echo "$centers"
+    
+    # Calculate accuracy metrics
+    calculate_accuracy
 }
 
 # Generate comprehensive report
@@ -605,15 +981,44 @@ EOF
 
 ### 5.4 Quality Metrics
 
+EOF
+
+    # Add accuracy metrics if available
+    if [ -f "$ACCURACY_FILE" ]; then
+        echo "**Clustering Quality Assessment:**" >> "$REPORT_FILE"
+        echo '```' >> "$REPORT_FILE"
+        cat "$ACCURACY_FILE" >> "$REPORT_FILE"
+        echo '```' >> "$REPORT_FILE"
+        echo "" >> "$REPORT_FILE"
+    fi
+
+    cat >> "$REPORT_FILE" << EOF
+
+**Metrics Explanation:**
+
 **Within-Cluster Sum of Squares (WCSS)**
 - Measures compactness of clusters
 - Lower values indicate tighter clusters
+- Formula: WCSS = Σ(distance(point, centroid)²)
 - Used to determine optimal K via elbow method
 
 **Silhouette Score**
 - Ranges from -1 to 1
-- Values close to 1 indicate well-separated clusters
-- Values close to 0 indicate overlapping clusters
+- Measures how similar points are to their own cluster vs. other clusters
+- Score > 0.7: Excellent cluster structure
+- Score > 0.5: Good cluster structure
+- Score > 0.25: Fair cluster structure
+- Score < 0.25: Poor cluster structure
+
+**Accuracy (for labeled datasets)**
+- Percentage of correctly clustered samples
+- Uses best mapping of clusters to true labels
+- Only applicable when ground truth labels are available
+
+**Purity Score**
+- Measures homogeneity of clusters
+- For each cluster, counts the most frequent true label
+- Higher purity indicates better cluster quality
 
 ---
 
@@ -785,6 +1190,30 @@ hadoop/
 - Spark version: 2.4.0-cdh6.x.x
 - Hadoop version: 2.6.0-cdh5.x.x
 
+**Build Process:**
+\`\`\`bash
+# Step 1: Clean previous artifacts
+mvn clean
+
+# Step 2: Compile Scala sources  
+mvn compile
+
+# Step 3: Package JAR with dependencies
+mvn package -DskipTests
+\`\`\`
+
+**Build Output:**
+- JAR Location: \`target/parallel-kmeans-1.0-SNAPSHOT.jar\`
+- Includes all dependencies
+- Scala and Spark libraries bundled
+
+**Maven Build Phases:**
+1. **validate** - Validate project structure
+2. **compile** - Compile Scala source code
+3. **test** - Run unit tests (skipped with -DskipTests)
+4. **package** - Create JAR file
+5. **install** - Install to local repository
+
 ### Appendix C: Execution Commands
 
 **Hadoop Execution:**
@@ -849,6 +1278,7 @@ function print_summary {
     printf "${GREEN}║${NC} %-20s : %-30s ${GREEN}║${NC}\n" "Result File" "$(basename $RESULT_FILE)"
     printf "${GREEN}║${NC} %-20s : %-30s ${GREEN}║${NC}\n" "Log File" "$(basename $LOG_FILE)"
     printf "${GREEN}║${NC} %-20s : %-30s ${GREEN}║${NC}\n" "Metrics File" "$(basename $METRICS_FILE)"
+    printf "${GREEN}║${NC} %-20s : %-30s ${GREEN}║${NC}\n" "Accuracy File" "$(basename $ACCURACY_FILE)"
     printf "${GREEN}║${NC} %-20s : %-30s ${GREEN}║${NC}\n" "Report File" "$(basename $REPORT_FILE)"
     echo -e "${GREEN}╚════════════════════════════════════════════════════════╝${NC}\n"
     
@@ -856,6 +1286,7 @@ function print_summary {
     info "  Results: $RESULT_FILE"
     info "  Log: $LOG_FILE"
     info "  Metrics: $METRICS_FILE"
+    info "  Accuracy: $ACCURACY_FILE"
     info "  Report: $REPORT_DIR/"
 }
 
