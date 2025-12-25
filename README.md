@@ -1,1 +1,1 @@
-Invoke-WebRequest -Uri https://packages.wazuh.com/4.x/windows/wazuh-agent-4.14.1-1.msi -OutFile $env:tmp\wazuh-agent; msiexec.exe /i $env:tmp\wazuh-agent /q WAZUH_MANAGER='192.168.228.128' WAZUH_AGENT_GROUP='Windows' WAZUH_AGENT_NAME='Windows-10-Home'
+curl -L -o %TEMP%\wazuh-agent.msi https://packages.wazuh.com/4.x/windows/wazuh-agent-4.14.1-1.msi && msiexec.exe /i %TEMP%\wazuh-agent.msi /q WAZUH_MANAGER="192.168.228.128" WAZUH_AGENT_GROUP="Windows" WAZUH_AGENT_NAME="Windows-10-Home"
